@@ -1,0 +1,37 @@
+# Python bytecode
+__pycache__/
+*.py[cod]
+
+# Virtual environments and local settings
+.venv*/
+venv/
+env/
+.env
+.env.*
+!.env.example
+
+# Packaging output
+build/
+dist/
+*.egg-info/
+.eggs/
+*.egg
+
+# Test environments, caches, and coverage
+.pytest_cache/
+.tox/
+.nox/
+.hypothesis/
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+
+# Linter and type-checker caches
+.ruff_cache/
+.mypy_cache/
+
+# Local editor and macOS files
+.idea/
+.vscode/
+.DS_Store

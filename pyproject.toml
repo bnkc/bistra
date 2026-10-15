@@ -1,0 +1,52 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "bistra"
+description = "Duration-aware parallel execution for pytest"
+version = "0.1.0a10"
+readme = "README.md"
+requires-python = ">=3.11"
+authors = [{ name = "Bistra contributors" }]
+license = "MIT"
+license-files = ["LICENSE"]
+classifiers = [
+    "Framework :: Pytest",
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Topic :: Software Development :: Testing",
+    "Operating System :: POSIX :: Linux",
+    "Operating System :: MacOS",
+    "Programming Language :: Python",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Programming Language :: Python :: 3.15",
+    "Programming Language :: Python :: Implementation :: CPython",
+]
+dependencies = ["pytest>=8.4.2,<10"]
+
+[project.entry-points.pytest11]
+bistra = "bistra.plugin"
+
+[project.scripts]
+bistra = "bistra.cli:main"
+
+[dependency-groups]
+dev = [
+    "pytest==8.4.2",
+    "pytest-xdist==3.8.0",
+    "pytest-asyncio==1.3.0",
+    "tox>=4.22,<5",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["bistra*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

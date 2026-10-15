@@ -1,0 +1,424 @@
+from __future__ import annotations
+
+import multiprocessing
+import os
+import threading
+import time
+
+import pytest
+from bistra.executor import WorkerStop, execute_parallel
+
+
+@pytest.mark.parametrize("states", ["42 Z\n77 S\n", "77 S\n"])
+def test_permission_error_for_a_dead_group_is_not_a_cleanup_failure(
+    monkeypatch, states
+):
+    from bistra import executor
+
+    def denied(*args):
+        raise PermissionError("group cannot be signalled")
+
+    monkeypatch.setattr(executor.os, "killpg", denied)
+    monkeypatch.setattr(executor.subprocess, "check_output", lambda *a, **k: states)
+    assert executor._signal_group(42, 0) is False
+
+
+def test_permission_error_for_a_live_group_is_not_hidden(monkeypatch):
+    from bistra import executor
+
+    def denied(*args):
+        raise PermissionError("real permission failure")
+
+    monkeypatch.setattr(executor.os, "killpg", denied)
+    monkeypatch.setattr(
+        executor.subprocess, "check_output", lambda *a, **k: "42 Z\n42 S\n"
+    )
+    with pytest.raises(PermissionError, match="real permission failure"):
+        executor._signal_group(42, 0)
+
+
+class Recorder:
+    def initialize(self, worker_id):
+        self.worker_id = worker_id
+
+    def execute(self, index, next_index, emit):
+        emit({"type": "value", "value": index, "next": next_index, "pid": os.getpid()})
+
+    def finalize(self, emit):
+        emit({"type": "finalized"})
+
+
+class Crasher(Recorder):
+    def execute(self, index, next_index, emit):
+        if index == 0:
+            os._exit(17)
+        super().execute(index, next_index, emit)
+
+
+class BrokenFinalizer(Recorder):
+    def finalize(self, emit):
+        emit({"type": "finalizer_called"})
+        raise RuntimeError("intentional finalizer failure")
+
+
+class StopWithBrokenCleanup(BrokenFinalizer):
+    def execute(self, index, next_index, emit):
+        raise WorkerStop("intentional early stop")
+
+
+def test_cleanup_error_during_controlled_stop_is_a_crash():
+    events = []
+    result = execute_parallel(
+        StopWithBrokenCleanup(), [0], workers=1, on_event=events.append
+    )
+    assert not result.completed
+    assert len(result.crashes) == 1
+    assert "intentional finalizer failure" in result.crashes[0]["traceback"]
+    assert [e["type"] for e in events].count("finalizer_called") == 1
+
+
+def test_failed_finalizer_is_not_invoked_twice():
+    events = []
+    result = execute_parallel(
+        BrokenFinalizer(), [0], workers=1, batch_size=1, on_event=events.append
+    )
+    assert result.completed == {0}
+    assert len(result.crashes) == 1
+    assert "intentional finalizer failure" in result.crashes[0]["traceback"]
+    assert [e["type"] for e in events].count("finalizer_called") == 1
+
+
+def test_exactly_once_and_worker_lookahead():
+    events = []
+    completions = []
+    result = execute_parallel(
+        Recorder(),
+        list(range(37)),
+        workers=3,
+        batch_size=4,
+        on_event=events.append,
+        on_complete=lambda index, elapsed: completions.append((index, elapsed)),
+    )
+    assert result.completed == set(range(37))
+    assert not result.crashes
+    assert sorted(i for i, _ in completions) == list(range(37))
+    values = [e for e in events if e["type"] == "value"]
+    assert sorted(e["value"] for e in values) == list(range(37))
+    assert all(e["pid"] != os.getpid() for e in values)
+    for worker in {e["worker_id"] for e in values}:
+        sequence = [e for e in values if e["worker_id"] == worker]
+        assert [e["next"] for e in sequence] == [e["value"] for e in sequence[1:]] + [
+            None
+        ]
+    assert len([e for e in events if e["type"] == "finalized"]) == 3
+
+
+def test_crashed_worker_cannot_appear_successful():
+    result = execute_parallel(
+        Crasher(), list(range(12)), workers=2, batch_size=2, on_event=lambda event: None
+    )
+    assert result.crashes
+    assert 0 not in result.completed
+    assert any(0 in crash["uncompleted"] for crash in result.crashes)
+
+
+def test_failfast_accounts_for_completed_work():
+    events = []
+
+    def stop(event):
+        events.append(event)
+        return False
+
+    result = execute_parallel(
+        Recorder(), list(range(100)), workers=2, batch_size=1, on_event=stop
+    )
+    assert result.stopped
+    assert len(result.completed) < 100
+    assert result.completed == {e["value"] for e in events if e["type"] == "value"}
+
+
+def test_dispatch_groups_preserve_local_order_and_exact_lookahead():
+    groups = [[6, 7, 8], [3, 4, 5], [0, 1, 2], [9]]
+    events = []
+    result = execute_parallel(
+        Recorder(), list(range(10)), workers=3, groups=groups, on_event=events.append
+    )
+    assert result.completed == set(range(10))
+    assert not result.crashes
+    values = [event for event in events if event["type"] == "value"]
+    assert sorted(event["value"] for event in values) == list(range(10))
+    for group in groups:
+        records = [event for event in values if event["value"] in group]
+        assert [event["value"] for event in records] == group
+        assert len({event["worker_id"] for event in records}) == 1
+    for worker in {event["worker_id"] for event in values}:
+        records = [event for event in values if event["worker_id"] == worker]
+        assert [event["next"] for event in records] == [
+            event["value"] for event in records[1:]
+        ] + [None]
+    assert groups == [[6, 7, 8], [3, 4, 5], [0, 1, 2], [9]]
+
+
+def test_group_order_refers_to_supplied_indices_not_numeric_sort():
+    events = []
+    result = execute_parallel(
+        Recorder(),
+        [5, 1, 8, 2, 9],
+        workers=2,
+        groups=[[5, 8, 9], [1, 2]],
+        on_event=events.append,
+    )
+    assert result.completed == {5, 1, 8, 2, 9}
+    assert [
+        e["value"] for e in events if e["type"] == "value" and e["worker_id"] == 0
+    ] == [5, 8, 9]
+
+
+@pytest.mark.parametrize(
+    "groups,fragment",
+    [
+        ([[0, 1], [1, 2]], "every job index exactly once"),
+        ([[0], [1]], "every job index exactly once"),
+        ([[0, 1], [2, 9]], "every job index exactly once"),
+        ([[1, 0], [2]], "preserve the original indices order"),
+        ([[0], [], [1, 2]], "must not be empty"),
+    ],
+)
+def test_invalid_groups_are_rejected_before_starting_workers(groups, fragment):
+    with pytest.raises(ValueError, match=fragment):
+        execute_parallel(
+            Recorder(), [0, 1, 2], workers=2, groups=groups, on_event=lambda event: None
+        )
+
+
+def _wait_for_file(path):
+    deadline = time.monotonic() + 5
+    while not path.exists():
+        if time.monotonic() > deadline:
+            raise RuntimeError(f"timed out waiting for {path.name}")
+        time.sleep(0.005)
+
+
+class OverlapRecorder(Recorder):
+    def __init__(self, directory):
+        self.directory = directory
+
+    def execute(self, index, next_index, emit):
+        (self.directory / f"child-{self.worker_id}").touch()
+        _wait_for_file(self.directory / "parent")
+        super().execute(index, next_index, emit)
+
+
+class ReservationRecorder(Recorder):
+    def __init__(self, directory):
+        self.directory = directory
+
+    def execute(self, index, next_index, emit):
+        if index == 2:
+            (self.directory / "medium-started").touch()
+        super().execute(index, next_index, emit)
+
+
+def _start_after_parent(connection, worker_id, adapter, initial):
+    from bistra.executor import _worker
+
+    _wait_for_file(adapter.directory / "parent-started")
+    _worker(connection, worker_id, adapter, initial)
+
+
+def test_long_parent_reserves_tiny_followup_and_leaves_whole_group_for_child(
+    tmp_path,
+):
+    context = multiprocessing.get_context("spawn")
+    adapter = ReservationRecorder(tmp_path)
+    events = []
+    parent_calls = []
+    completions = []
+    groups = [[0], [1], [2, 3], [4]]
+
+    def start_worker(worker_id, initial):
+        parent, child = context.Pipe(duplex=True)
+        process = context.Process(
+            target=_start_after_parent,
+            args=(child, worker_id, adapter, initial),
+        )
+        try:
+            process.start()
+        finally:
+            child.close()
+        return process, parent
+
+    def parent_execute(index, next_index):
+        parent_calls.append((index, next_index))
+        if index == 1:
+            (tmp_path / "parent-started").touch()
+            _wait_for_file(tmp_path / "medium-started")
+
+    result = execute_parallel(
+        adapter,
+        list(range(5)),
+        workers=2,
+        groups=groups,
+        estimates={0: 1, 1: 100, 2: 3, 3: 3, 4: 0.001},
+        start_worker=start_worker,
+        parent_execute=parent_execute,
+        on_event=events.append,
+        on_complete=lambda index, elapsed: completions.append(index),
+    )
+    assert result.completed == set(range(5))
+    assert not result.crashes
+    assert sorted(completions) == list(range(5))
+    assert parent_calls == [(1, 4), (4, None)]
+    values = [event for event in events if event["type"] == "value"]
+    assert [(event["value"], event["next"]) for event in values] == [
+        (0, 2),
+        (2, 3),
+        (3, None),
+    ]
+    assert len({event["pid"] for event in values}) == 1
+    assert values[0]["pid"] != os.getpid()
+    assert groups == [[0], [1], [2, 3], [4]]
+
+
+@pytest.mark.parametrize("grouped", [False, True])
+def test_parent_overlaps_children_and_callbacks_stay_on_main_thread(
+    tmp_path, grouped, monkeypatch
+):
+    caller = threading.get_ident()
+    parent_pid = os.getpid()
+    indices = list(range(50))
+    events = []
+    parent_calls = []
+    completions = []
+    starts = []
+    original_start = multiprocessing.process.BaseProcess.start
+
+    def process_start(process):
+        starts.append(threading.get_ident())
+        assert not any(
+            thread.name == "bistra-coordinator" for thread in threading.enumerate()
+        )
+        return original_start(process)
+
+    monkeypatch.setattr(multiprocessing.process.BaseProcess, "start", process_start)
+
+    def parent_execute(index, next_index):
+        assert threading.get_ident() == caller
+        assert starts == [caller, caller]
+        parent_calls.append((index, next_index, os.getpid()))
+        if len(parent_calls) == 1:
+            (tmp_path / "parent").touch()
+            _wait_for_file(tmp_path / "child-0")
+            _wait_for_file(tmp_path / "child-1")
+
+    def event(value):
+        assert threading.get_ident() == caller
+        events.append(value)
+
+    def complete(index, elapsed):
+        assert threading.get_ident() == caller
+        completions.append(index)
+
+    groups = [[index] for index in reversed(indices)] if grouped else None
+    result = execute_parallel(
+        OverlapRecorder(tmp_path),
+        indices,
+        workers=3,
+        batch_size=1,
+        groups=groups,
+        parent_execute=parent_execute,
+        on_event=event,
+        on_complete=complete,
+    )
+    assert result.completed == set(indices)
+    assert not result.crashes
+    assert sorted(completions) == indices
+    assert all(call[2] == parent_pid for call in parent_calls)
+    parent_order = [call[0] for call in parent_calls]
+    assert [call[1] for call in parent_calls] == parent_order[1:] + [None]
+    values = [event for event in events if event["type"] == "value"]
+    assert all(event["pid"] != parent_pid for event in values)
+    assert sorted(parent_order + [event["value"] for event in values]) == indices
+    for worker in {event["worker_id"] for event in values}:
+        sequence = [event for event in values if event["worker_id"] == worker]
+        assert [event["next"] for event in sequence] == [
+            event["value"] for event in sequence[1:]
+        ] + [None]
+
+
+@pytest.mark.parametrize("completed", [False, True])
+def test_parent_controlled_stop_accounts_for_completion(completed):
+    parent_calls = []
+
+    def parent_execute(index, next_index):
+        parent_calls.append(index)
+        raise WorkerStop("parent requested stop", completed=completed)
+
+    result = execute_parallel(
+        Recorder(),
+        list(range(20)),
+        workers=2,
+        batch_size=1,
+        parent_execute=parent_execute,
+        on_event=lambda event: None,
+    )
+    assert result.stopped
+    assert not result.crashes
+    assert len(parent_calls) == 1
+    assert (parent_calls[0] in result.completed) is completed
+
+
+class WaitingRecorder(Recorder):
+    def __init__(self, pidfile):
+        self.pidfile = pidfile
+
+    def execute(self, index, next_index, emit):
+        self.pidfile.write_text(str(os.getpid()))
+        time.sleep(30)
+
+
+@pytest.mark.parametrize("error", [RuntimeError, KeyboardInterrupt])
+def test_parent_exception_cleans_up_active_children(tmp_path, error):
+    pidfile = tmp_path / "worker-pid"
+
+    def parent_execute(index, next_index):
+        _wait_for_file(pidfile)
+        raise error("parent failed")
+
+    with pytest.raises(error, match="parent failed"):
+        execute_parallel(
+            WaitingRecorder(pidfile),
+            [0, 1],
+            workers=2,
+            parent_execute=parent_execute,
+            on_event=lambda event: None,
+        )
+    with pytest.raises(ProcessLookupError):
+        os.kill(int(pidfile.read_text()), 0)
+
+
+def test_one_slot_runs_all_jobs_in_parent():
+    calls = []
+    result = execute_parallel(
+        Recorder(),
+        [0, 1, 2, 3],
+        workers=1,
+        groups=[[0, 1, 2, 3]],
+        parent_execute=lambda index, next_index: calls.append((index, next_index)),
+        on_event=lambda event: pytest.fail("no child worker should run"),
+    )
+    assert result.completed == {0, 1, 2, 3}
+    assert calls == [(0, 1), (1, 2), (2, 3), (3, None)]
+
+
+def test_child_crash_remains_a_failure_with_parent_execution():
+    result = execute_parallel(
+        Crasher(),
+        list(range(20)),
+        workers=2,
+        parent_execute=lambda index, next_index: None,
+        on_event=lambda event: None,
+    )
+    assert result.crashes
+    assert 0 not in result.completed
+    assert any(0 in crash["uncompleted"] for crash in result.crashes)

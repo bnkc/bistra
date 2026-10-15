@@ -69,7 +69,6 @@ def test_worker_session_stop_is_propagated(tmp_path, subprocess_env, attribute, 
     [
         (["--pdb"], "interactive debugging requires -j 1"),
         (["--trace"], "interactive debugging requires -j 1"),
-        (["-p", "xdist.plugin", "-n", "2"], "cannot be combined with xdist"),
     ],
 )
 def test_conflicting_modes_fail_before_execution(tmp_path, subprocess_env, args, fragment):

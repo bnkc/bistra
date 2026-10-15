@@ -39,7 +39,6 @@ bistra = "bistra.cli:main"
 
 [dependency-groups]
 dev = [
-    { include-group = "test" },
     { include-group = "lint" },
     { include-group = "type" },
     { include-group = "package" },
@@ -47,7 +46,6 @@ dev = [
     "pytest==8.4.2",
     "tox>=4.65,<5",
 ]
-test = ["pytest-xdist==3.8.0"]
 lint = ["ruff==0.17.1"]
 type = ["ty==0.0.88"]
 package = ["build>=1.6,<2", "twine>=7,<8"]
@@ -95,7 +93,6 @@ env_list = [
 [tool.tox.env_run_base]
 description = "Test the installed wheel"
 package = "wheel"
-dependency_groups = ["test"]
 deps = [
     { replace = "if", condition = "factor.pytestmin", then = [
         "pytest==8.4.2",

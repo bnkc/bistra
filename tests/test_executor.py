@@ -315,10 +315,12 @@ def test_parent_overlaps_children_and_callbacks_stay_on_main_thread(tmp_path, re
     completions = []
     starts = []
     original_start = multiprocessing.process.BaseProcess.start
+    existing_threads = set(threading.enumerate())
 
     def process_start(process):
         starts.append(threading.get_ident())
-        assert not any(thread.name == "bistra-coordinator" for thread in threading.enumerate())
+        # The outer Bistra run may already have its own coordinator.
+        assert not any(thread.name == "bistra-coordinator" for thread in set(threading.enumerate()) - existing_threads)
         return original_start(process)
 
     monkeypatch.setattr(multiprocessing.process.BaseProcess, "start", process_start)

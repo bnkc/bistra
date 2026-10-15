@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 import json
 import os
 import subprocess
@@ -7,6 +5,7 @@ import sys
 from importlib.metadata import version
 
 import pytest
+
 from bistra.cli import main
 
 
@@ -29,6 +28,8 @@ def test_cli_forwards_pytest_arguments(monkeypatch):
     )
     assert calls == [
         [
+            "-p",
+            "bistra",
             "--bistra",
             "--bistra-workers",
             "2",
@@ -40,7 +41,7 @@ def test_cli_forwards_pytest_arguments(monkeypatch):
     ]
 
 
-@pytest.mark.parametrize("arguments", [["-j", "0"], ["--workers", "-1"]])
+@pytest.mark.parametrize("arguments", [["-j", "0"], ["--workers", "-1"], ["-j", "many"]])
 def test_cli_rejects_invalid_counts(arguments):
     with pytest.raises(SystemExit) as error:
         main(arguments)
@@ -68,7 +69,7 @@ def test_installed_plugin_adds_help_options(pytester, monkeypatch):
     result.stdout.fnmatch_lines(["*--bistra *", "*--bistra-workers=*"])
 
 
-def _run(tmp_path, arguments, *, autoload=False, expected_workers=1, enabled=False):
+def _run(tmp_path, subprocess_env, arguments, *, autoload=False, expected_workers=1, enabled=False):
     (tmp_path / "pytest.ini").write_text("[pytest]\n")
     (tmp_path / "conftest.py").write_text("""
 import json
@@ -97,25 +98,18 @@ def value():
 def test_execution(index, value, request):
     assert value == 42
     collection = json.loads(Path(f"collection-{os.getpid()}.json").read_text())
+    assert os.getpid() == collection["pid"]
     if int(os.environ["BISTRA_EXPECT_WORKERS"]) > 1:
-        assert os.getpid() == collection["pid"]
         assert request.config.workerinput["workerid"].startswith("bistra")
-    else:
-        assert os.getpid() == collection["pid"]
     import time
     time.sleep(0.02)
     Path(f"executed-{index}.json").write_text(json.dumps({"pid": os.getpid()}))
 """)
-    env = os.environ.copy()
-    env.pop("PYTEST_PLUGINS", None)
+    env = subprocess_env.copy()
     if autoload:
         env.pop("PYTEST_DISABLE_PLUGIN_AUTOLOAD", None)
-    else:
-        env["PYTEST_DISABLE_PLUGIN_AUTOLOAD"] = "1"
-    env["PYTEST_ADDOPTS"] = ""
     env["BISTRA_EXPECT_WORKERS"] = str(expected_workers)
     env["BISTRA_EXPECT_ENABLED"] = str(int(enabled))
-    env["XDG_CACHE_HOME"] = str(tmp_path / "cache")
     process = subprocess.run(
         [sys.executable, "-m", *arguments],
         cwd=tmp_path,
@@ -128,27 +122,23 @@ def test_execution(index, value, request):
     assert "4 passed" in process.stdout
     assert "PytestAssertRewriteWarning" not in process.stdout + process.stderr
     assert len(list(tmp_path.glob("collection-*.json"))) == expected_workers
-    assert all(
-        json.loads(path.read_text())["items"] == 4
-        for path in tmp_path.glob("collection-*.json")
-    )
-    records = [
-        json.loads((tmp_path / f"executed-{i}.json").read_text()) for i in range(4)
-    ]
+    assert all(json.loads(path.read_text())["items"] == 4 for path in tmp_path.glob("collection-*.json"))
+    records = [json.loads((tmp_path / f"executed-{i}.json").read_text()) for i in range(4)]
     assert len({record["pid"] for record in records}) == expected_workers
     return process
 
 
-def test_installation_does_not_enable_runner(tmp_path):
-    process = _run(tmp_path, ["pytest", "-q"], autoload=True)
+def test_installation_does_not_enable_runner(tmp_path, subprocess_env):
+    process = _run(tmp_path, subprocess_env, ["pytest", "-q"], autoload=True)
     assert "bistra: dispatching" not in process.stdout
 
 
-@pytest.mark.skipif(not hasattr(os, "fork"), reason="fork workers require POSIX")
+@pytest.mark.skipif(os.name != "posix", reason="parallel workers require POSIX")
 @pytest.mark.parametrize("autoload", [False, True])
-def test_cli_loads_plugin_once_with_or_without_autoload(tmp_path, autoload):
+def test_cli_loads_plugin_once_with_or_without_autoload(tmp_path, subprocess_env, autoload):
     _run(
         tmp_path,
+        subprocess_env,
         ["bistra", "-j", "2", "--", "-q", "-Werror"],
         autoload=autoload,
         expected_workers=2,
@@ -156,10 +146,11 @@ def test_cli_loads_plugin_once_with_or_without_autoload(tmp_path, autoload):
     )
 
 
-@pytest.mark.skipif(not hasattr(os, "fork"), reason="fork workers require POSIX")
-def test_pytest_opt_in_entry_point(tmp_path):
+@pytest.mark.skipif(os.name != "posix", reason="parallel workers require POSIX")
+def test_pytest_opt_in_entry_point(tmp_path, subprocess_env):
     _run(
         tmp_path,
+        subprocess_env,
         ["pytest", "--bistra", "--bistra-workers", "2", "-q"],
         autoload=True,
         expected_workers=2,
@@ -167,18 +158,16 @@ def test_pytest_opt_in_entry_point(tmp_path):
     )
 
 
-def test_cli_one_worker_uses_pytest_serial_execution(tmp_path):
-    _run(tmp_path, ["bistra", "-j", "1", "--", "-q"], enabled=True)
+def test_cli_one_worker_uses_pytest_serial_execution(tmp_path, subprocess_env):
+    _run(tmp_path, subprocess_env, ["bistra", "-j", "1", "--", "-q"], enabled=True)
 
 
-def test_explicit_plugin_loading_stays_disabled_without_opt_in(tmp_path):
-    _run(tmp_path, ["pytest", "-p", "bistra", "-q"])
+def test_explicit_plugin_loading_stays_disabled_without_opt_in(tmp_path, subprocess_env):
+    _run(tmp_path, subprocess_env, ["pytest", "-p", "bistra", "-q"])
 
 
-def test_pytest_rejects_invalid_worker_count(tmp_path):
-    env = os.environ.copy()
-    env["PYTEST_DISABLE_PLUGIN_AUTOLOAD"] = "1"
-    env["PYTEST_ADDOPTS"] = ""
+@pytest.mark.parametrize("count", ["0", "-1", "many"])
+def test_pytest_rejects_invalid_worker_count(tmp_path, subprocess_env, count):
     process = subprocess.run(
         [
             sys.executable,
@@ -188,10 +177,10 @@ def test_pytest_rejects_invalid_worker_count(tmp_path):
             "bistra",
             "--bistra",
             "--bistra-workers",
-            "0",
+            count,
         ],
         cwd=tmp_path,
-        env=env,
+        env=subprocess_env,
         capture_output=True,
         text=True,
         timeout=15,

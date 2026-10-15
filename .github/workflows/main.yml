@@ -38,12 +38,12 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
       - name: Install tox
-        run: python -m pip install 'tox>=4.22,<5'
+        run: python -m pip install 'tox>=4.65,<5'
       - name: Test installed wheel
         run: python -m tox -e py-${{ matrix.pytest }}
 
   checks:
-    name: Lint and package
+    name: Lint, types, and package
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -53,6 +53,6 @@ jobs:
         with:
           python-version: "3.13"
       - name: Install tox
-        run: python -m pip install 'tox>=4.22,<5'
-      - name: Check style and distributions
-        run: python -m tox -e lint,package
+        run: python -m pip install 'tox>=4.65,<5'
+      - name: Check style, types, and distributions
+        run: python -m tox -e lint,type,package

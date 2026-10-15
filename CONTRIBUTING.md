@@ -1,52 +1,53 @@
 # Contributing
 
-## Development checks
+## Development
 
 From the repository root:
 
 ```sh
 uv sync --locked
-uv run tox -e py,lint,package
+uv run pre-commit install
+uv run tox -e py,lint,type,package
 ```
 
-The `py` environment builds and installs a wheel, then runs the regression tests
-with the current interpreter. To run selected tests:
+Pre-commit runs Ruff fixes and formatting, then tox for types and the full test
+suite on every commit. Tests use the installed wheel on your current Python.
+To check all tracked files, run `uv run pre-commit run --all-files`. Review and
+stage any fixes, then commit again.
+
+`py` tests the installed wheel with the current interpreter and latest allowed pytest.
+`lint` checks Ruff rules and formatting, `type` checks `src/` with ty targeting
+Python 3.11, and `package` builds source and wheel distributions and checks their
+metadata with Twine.
+
+To run selected tests:
 
 ```sh
 uv run tox -e py -- tests/test_bistra_cli.py
 ```
 
-Run `uv run tox` for the full configured matrix: Python 3.11 with pytest 8.4.2,
-Python 3.11–3.15 with the latest permitted pytest, plus lint and package checks.
-Those Python interpreters must be available locally. The GitHub Actions workflow
-configures the Python matrix on Linux and an additional macOS test job.
+Run `uv run tox` for the full matrix: Python 3.11 with pytest 8.4.2,
+Python 3.11–3.15 with the latest permitted pytest, plus the other checks above.
+These interpreters must be installed locally. GitHub Actions runs this test
+matrix on Linux and also tests Python 3.15 on macOS.
 
-- `uv run tox -e lint` runs Flake8 over `src/` and `tests/`.
-- `uv run tox -e package` builds a source distribution and a wheel from it, then
-  checks their metadata with `twine check --strict`.
-- `uv build` writes a source distribution and wheel to `dist/`.
+To apply lint fixes and format the code:
 
-## Project setup
+```sh
+uv run ruff check --fix src tests
+uv run ruff format src tests
+```
 
-The packaging scaffold comes from
-[pytest-dev/cookiecutter-pytest-plugin](https://github.com/pytest-dev/cookiecutter-pytest-plugin/tree/8f38e95b344f07071c1adada1fe209137c7effab),
-at commit `8f38e95b344f07071c1adada1fe209137c7effab` (2024-09-18).
-The existing implementation, regression tests, and README were retained.
+Run `uv build` to write a source distribution and wheel to `dist/`.
 
-Deliberate adaptations:
+The local environment uses Python 3.13 and dependencies locked in `uv.lock`.
+Tox resolves dependencies separately; its environments do not use the uv lock.
+Tool configuration and dependency groups live in `pyproject.toml`.
 
-- Keep `bistra` as the distribution, import package, pytest plugin, and CLI name.
-- Require Python 3.11+ and `pytest>=8.4.2,<10`; parallel execution supports Linux
-  and macOS.
-- Keep implementation in `src/bistra/` and tests in `tests/`, with pytest's
-  `pytester` helper available for plugin tests.
-- Use `pyproject.toml` as the version's source of truth; runtime `__version__`
-  reads the installed distribution metadata.
-- Keep the README in Markdown and omit a separate documentation site.
+## Project notes
 
-## Pending follow-ups
+Code lives in `src/bistra/` and tests in `tests/`. Set the package version in
+`pyproject.toml`; `bistra.__version__` reads the installed package metadata.
 
-The scaffold includes test, lint, and package-check jobs. GitHub repository
-and PyPI project wiring, a release/versioning policy, and automated publishing
-are still pending. Formatter enforcement, type checking, and a changelog workflow
-also remain follow-ups.
+PyPI setup, a release/versioning policy, automated publishing, and a changelog
+workflow are still pending.

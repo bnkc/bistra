@@ -1,121 +1,88 @@
 # bistra
 
-A small, experimental pytest extension that collects concurrently in fresh
-interpreters, then runs tests through a shared duration-aware queue. Tests still use pytest's assertions, fixtures,
-capture, and reports. Test results are never cached or skipped by bistra.
+Run pytest in parallel, using past test timings to schedule slower groups first.
+Bistra uses pytest's assertions, fixtures, capture, and reports.
 
-**Requirements:** macOS or Linux for parallel execution, Python 3.11+, and
-pytest 8.4.2–9.x. No Rust toolchain or compiler is needed. Windows parallel
-execution is not supported. One worker delegates execution to ordinary pytest.
+Still in alpha. Parallel runs require **Linux or macOS, Python 3.11+, and
+pytest 8.4.2–9.x**.
 
-## Install in your own project
+## Install
 
-Clone or download this repository. From the Python project whose tests you want
-to run, install bistra as a development dependency. Replace the example path with
-your checkout's location:
+Clone this repository, then install it in the project you want to test:
 
 ```sh
 cd /path/to/your-project
 uv add --dev /path/to/bistra
-uv run bistra --version
 uv run bistra -- -q tests/
 ```
 
-Keep the checkout at that path while your uv project references it. If you use pip,
-activate the project's existing virtual environment instead:
+Replace `/path/to/bistra` with your checkout and keep it there while uv references
+it. With pip, use your project's virtual environment:
 
 ```sh
 python -m pip install /path/to/bistra
 python -m bistra -- -q tests/
 ```
 
-Your project's test dependencies must already be installed. Installing bistra
-does not enable it for ordinary pytest invocations. You can opt in through pytest:
+Install your project's test dependencies as usual. Bistra defaults to 12 workers;
+use `-j N` to change that or `-j 1` for ordinary serial pytest. Put pytest arguments
+after `--`.
+
+You can also enable Bistra through pytest:
 
 ```sh
 uv run pytest --bistra -q tests/
 ```
 
-If `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1` is set, use the `bistra` command above, or
-add `-p bistra` to the pytest command.
+Plain `pytest` runs are unchanged. Use `--bistra-workers N` to set the worker count.
+If `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1` is set, add `-p bistra` or use the `bistra`
+command.
 
 ## Check whether it helps
 
-Start with a small representative selection, then widen it if results agree:
+Compare a small, representative selection using the same pytest options:
 
 ```sh
 time uv run pytest -q tests/
 time uv run bistra -- -q tests/
 ```
 
-Use the same paths, filters and pytest options on both commands. Compare pass,
-failure, error, skip and xfail results, not just elapsed time. Repeat each command
-three times; do not run the comparisons simultaneously. Dependency installation
-is outside the timed commands. Avoid combining this first comparison with xdist,
-Testmon selection, or coverage instrumentation.
+Run each command three times, one at a time, and check that test outcomes agree.
+Leave xdist, Testmon, and coverage out of this first comparison.
 
-Bistra automatically learns test durations. The first parallel run records
-timings; subsequent runs use that history to start expensive work earlier and
-distribute it across workers. Tests sharing module or class fixtures stay grouped
-to preserve fixture reuse. The optional local cache stores timings, never results;
-an unavailable cache does not prevent tests from running. Compare the initial
-learning run and subsequent runs separately when measuring speed.
-
-Bistra defaults to 12 workers. Override it with `-j N` or pytest's
-`--bistra-workers N`.
-Use `-j 1` for ordinary serial execution. Put pytest's arguments after `--`.
-Run `bistra --help` for details.
+The first parallel run records timings; later runs use them to schedule tests.
+Measure the first run separately. The cache stores durations only, and tests
+still run if it is unavailable.
 
 ## Compatibility
 
-Each child starts a fresh Python interpreter, so native libraries initialize in
-that interpreter instead of inheriting another process's runtime state. No native
-routing decorators are needed. The configured worker count includes the original
-process, which executes tests alongside the fresh workers.
+Each child collects tests in a fresh interpreter, where native libraries initialize
+independently. The original process also runs tests and counts toward the worker
+limit. Bistra uses pytest internals, so pytest 10 is excluded until supported.
 
-Every interpreter collects the same suite concurrently. Before executing any tests,
-Bistra checks that ordered test IDs and fixture groups agree. Non-deterministic
-collection fails explicitly; collection hooks must tolerate running per interpreter.
+- Collection must produce the same ordered test IDs and fixture groups in every
+  interpreter. Bistra checks this before running tests. Collection hooks run in
+  each interpreter.
+- Tests sharing package, module, or class fixtures stay grouped. Session fixtures
+  are local to each worker. Dynamically requested fixtures cannot guide grouping
+  and may repeat across workers.
+- Collection state is local to each interpreter. Tests must isolate shared
+  databases, files, and other external resources.
+- Plugins passed to `pytest.main` must be importable modules. Use one worker for
+  plugin instances. Scripts starting parallel pytest need an
+  `if __name__ == "__main__":` guard.
+- `worker_id` and `testrun_uid` fixtures work without xdist. Before conftest imports,
+  worker identity is available through `config.workerinput` and
+  `PYTEST_XDIST_WORKER`, `PYTEST_XDIST_WORKER_COUNT`, and `PYTEST_XDIST_TESTRUNUID`.
+  Bistra does not implement all xdist worker-startup hooks.
+- Do not combine Bistra with xdist worker options. Compatibility with coverage,
+  Testmon, and other plugins that control test execution is not yet verified.
+- Async tests still need an async plugin, such as pytest-asyncio. Use one worker
+  for interactive debugging. Worker crashes count as failures.
+- The original process delivers child reports on its main thread. A long test
+  there can delay progress updates and stop requests; running tests finish before
+  an early stop takes effect.
 
-This is an alpha prototype, not a guaranteed speedup or a universal plugin
-replacement. It uses pytest internals; its dependency is bounded below pytest 10.
+## Development
 
-- Session fixtures execute once per worker; module/class fixtures can repeat
-  when tests are split across workers. Tests must tolerate parallel execution.
-- Python state created during collection is local to each interpreter. Shared
-  databases, files, and external resources still require fixture isolation.
-- Programmatic pytest plugins must be importable modules. For plugin instances
-  passed directly to `pytest.main`, use `-j 1`. Python scripts calling parallel
-  pytest must guard their entry point with `if __name__ == "__main__":`.
-- Worker identity is available before initial conftest imports through
-  `config.workerinput` and the `PYTEST_XDIST_WORKER`, `PYTEST_XDIST_WORKER_COUNT`,
-  and `PYTEST_XDIST_TESTRUNUID` environment variables. The `worker_id` and
-  `testrun_uid` fixtures work without installing xdist. Bistra does not implement
-  xdist's complete worker-startup hook lifecycle.
-- Do not combine bistra with xdist worker options. Coverage, Testmon and plugins
-  that manage their own execution lifecycle have not been generally certified.
-- Async tests continue to require your normal async plugin, such as pytest-asyncio.
-  Interactive debugging requires `-j 1`. Worker crashes are reported as failures.
-- Reports from children are delivered on the original process's main thread.
-  Progress updates and parent-plugin stop decisions can wait while that process
-  executes a long test; in-flight tests finish before an early stop takes effect.
-
-## Source and development
-
-The `src/bistra/` directory contains the complete implementation; `tests/`
-contains focused runner regression tests. To develop from this checkout:
-
-```sh
-uv sync --locked
-uv run tox -e py,lint,package
-```
-
-This tests the installed wheel with the current interpreter, checks style, and
-validates package metadata. See [CONTRIBUTING.md](CONTRIBUTING.md) for the full
-compatibility matrix and project setup.
-
-To build a source distribution and wheel in `dist/`:
-
-```sh
-uv build
-```
+See [CONTRIBUTING.md](CONTRIBUTING.md) for setup, checks, and builds.

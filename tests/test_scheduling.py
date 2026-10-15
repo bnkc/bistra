@@ -14,25 +14,36 @@ def test_prioritize_groups_moves_late_expensive_tests_to_separate_front_jobs():
 
 def test_prioritize_groups_preserves_fixture_consumers_and_stable_ties():
     groups = [[0, 1], [2], [3, 4], [5]]
-    assert prioritize_groups(groups, {0: 1, 1: 2, 2: 4, 3: 8, 4: 0, 5: 8}) == [
-        [3, 4], [5], [2], [0, 1]
-    ]
+    assert prioritize_groups(groups, {0: 1, 1: 2, 2: 4, 3: 8, 4: 0, 5: 8}) == [[3, 4], [5], [2], [0, 1]]
 
 
 def test_prioritize_groups_uses_selected_positive_mean_for_unknown_and_invalid():
     durations = {
-        0: "2", 1: 4, 2: 0, 3: -1, 4: math.nan, 5: math.inf,
-        6: "bad", 7: True, 99: 10000,
+        0: "2",
+        1: 4,
+        2: 0,
+        3: -1,
+        4: math.nan,
+        5: math.inf,
+        6: "bad",
+        7: True,
+        99: 10000,
     }
     assert prioritize_groups([[index] for index in range(9)], durations) == [
-        [1], [3], [4], [5], [6], [7], [8], [0], [2]
+        [1],
+        [3],
+        [4],
+        [5],
+        [6],
+        [7],
+        [8],
+        [0],
+        [2],
     ]
 
 
 def test_prioritize_groups_without_positive_history_uses_one_second():
-    assert prioritize_groups([[0], [1, 2], [3]], {0: 0, 99: 10000}) == [
-        [1, 2], [3], [0]
-    ]
+    assert prioritize_groups([[0], [1, 2], [3]], {0: 0, 99: 10000}) == [[1, 2], [3], [0]]
     assert prioritize_groups([], {}) == []
 
 

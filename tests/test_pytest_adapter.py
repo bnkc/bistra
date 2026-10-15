@@ -1,6 +1,3 @@
-from __future__ import annotations
-
-import os
 import subprocess
 import sys
 import xml.etree.ElementTree as ET
@@ -51,12 +48,9 @@ def test_teardown(teardown_error): pass
 """
 
 
-def test_parallel_reports_capture_and_fixture_lifetimes(tmp_path):
+def test_parallel_reports_capture_and_fixture_lifetimes(tmp_path, subprocess_env):
     (tmp_path / "pytest.ini").write_text("[pytest]\n")
     (tmp_path / "test_cases.py").write_text(SOURCE)
-    env = os.environ.copy()
-    env["PYTEST_DISABLE_PLUGIN_AUTOLOAD"] = "1"
-    env["XDG_CACHE_HOME"] = str(tmp_path / "cache")
     results = []
     for workers in (1, 3):
         xml = tmp_path / f"result-{workers}.xml"
@@ -72,9 +66,10 @@ def test_parallel_reports_capture_and_fixture_lifetimes(tmp_path):
                 f"--junitxml={xml}",
             ],
             cwd=tmp_path,
-            env=env,
+            env=subprocess_env,
             text=True,
             capture_output=True,
+            timeout=30,
         )
         assert p.returncode == 1, p.stdout + p.stderr
         assert "intentional assertion" in p.stdout

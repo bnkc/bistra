@@ -1,5 +1,4 @@
 import json
-import os
 import pickle
 import subprocess
 import sys
@@ -43,9 +42,7 @@ def test_local_warning_preserves_text_family_and_qualified_metadata():
     class LocalWarning(ResourceWarning):
         pass
 
-    original = warnings.WarningMessage(
-        LocalWarning("local evidence"), LocalWarning, "local.py", 4
-    )
+    original = warnings.WarningMessage(LocalWarning("local evidence"), LocalWarning, "local.py", 4)
     module = sys.modules[LocalWarning.__module__]
     before = dict(vars(module))
     data = pickle.loads(pickle.dumps(_serialize_warning(original)))
@@ -54,18 +51,13 @@ def test_local_warning_preserves_text_family_and_qualified_metadata():
     assert restored.category.__name__ == "LocalWarning"
     assert issubclass(restored.category, ResourceWarning)
     assert isinstance(restored.message, restored.category)
-    assert (
-        restored._bistra_warning_metadata["category_class"]["qualname"]
-        == LocalWarning.__qualname__
-    )
+    assert restored._bistra_warning_metadata["category_class"]["qualname"] == LocalWarning.__qualname__
     assert restored._bistra_warning_fallback is True
     assert dict(vars(module)) == before  # No synthetic types installed in modules.
 
 
 def test_untransportable_args_and_source_keep_text_without_crashing():
-    original = warnings.WarningMessage(
-        UserWarning(lambda: None), UserWarning, "example.py", 2, source=lambda: None
-    )
+    original = warnings.WarningMessage(UserWarning(lambda: None), UserWarning, "example.py", 2, source=lambda: None)
     data = pickle.loads(pickle.dumps(_serialize_warning(original)))
     restored = _deserialize_warning(data)
     assert str(restored.message) == str(original.message)
@@ -76,7 +68,7 @@ def test_untransportable_args_and_source_keep_text_without_crashing():
     assert "lambda" in restored.source
 
 
-def test_parallel_warning_observers_match_serial_for_reconstructable_warnings(tmp_path):
+def test_parallel_warning_observers_match_serial_for_reconstructable_warnings(tmp_path, subprocess_env):
     (tmp_path / "pytest.ini").write_text("[pytest]\nfilterwarnings = always\n")
     (tmp_path / "conftest.py").write_text(
         textwrap.dedent("""
@@ -122,16 +114,12 @@ def test_parallel_warning_observers_match_serial_for_reconstructable_warnings(tm
             warnings.warn(LocalWarning("local evidence"))
     """)
     )
-    env = dict(os.environ)
-    env["PYTEST_DISABLE_PLUGIN_AUTOLOAD"] = "1"
     records = []
     for workers in (1, 2):
         path = tmp_path / f"warnings-{workers}.jsonl"
-        env["WARNINGS_RECORD"] = str(path)
+        env = {**subprocess_env, "WARNINGS_RECORD": str(path)}
         command = [sys.executable, "-m", "bistra", "-j", str(workers), "--", "-q"]
-        process = subprocess.run(
-            command, cwd=tmp_path, env=env, capture_output=True, text=True, timeout=30
-        )
+        process = subprocess.run(command, cwd=tmp_path, env=env, capture_output=True, text=True, timeout=30)
         assert process.returncode == 0, process.stdout + process.stderr
         assert "LocalWarning: local evidence" in process.stdout
         assert "DetailedWarning: detail 23: evidence" in process.stdout

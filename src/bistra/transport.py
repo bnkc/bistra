@@ -1,16 +1,16 @@
-"""Incremental reception of multiprocessing Connection frames on POSIX sockets.
+"""Read multiprocessing Connection frames incrementally on POSIX sockets.
 
-Connection.poll() only promises some bytes, not a complete pickle. Connection.recv()
-can therefore block forever if a worker dies midway through a packet while a
-descendant retains its socket. This reader never waits for the rest of a frame.
+Connection.poll() can report a partial packet. Calling recv() then could hang
+if the worker dies while a descendant keeps its socket open. This reader never
+waits for the rest of a frame.
 """
-
-from __future__ import annotations
 
 import os
 import socket
 import struct
 import sys
+from collections.abc import Iterator
+from multiprocessing.connection import Connection
 from multiprocessing.reduction import ForkingPickler
 
 
@@ -19,42 +19,35 @@ class TransportError(Exception):
 
 
 class FramedReceiver:
-    """Read a duplex Connection without changing its blocking send behavior.
+    """Read a duplex Connection without making its sends nonblocking.
 
-    MSG_DONTWAIT applies to individual reads. Setting O_NONBLOCK on even a
-    duplicated descriptor would also make Connection.send nonblocking.
+    MSG_DONTWAIT affects one read. O_NONBLOCK would also affect Connection.send,
+    even when set on a duplicated descriptor.
     """
 
-    def __init__(self, connection):
+    def __init__(self, connection: Connection) -> None:
         self._socket = socket.socket(fileno=os.dup(connection.fileno()))
         self._buffer = bytearray()
-        self._expected = None
+        self._expected: int | None = None
         self.eof = False
 
-    def close(self):
+    def close(self) -> None:
         self._socket.close()
 
     @property
-    def incomplete(self):
+    def incomplete(self) -> str | None:
         if self._expected is not None:
-            return (
-                f"incomplete worker frame: received {len(self._buffer)} of "
-                f"{self._expected} payload bytes"
-            )
+            return f"incomplete worker frame: received {len(self._buffer)} of {self._expected} payload bytes"
         if self._buffer:
             needed = 12 if len(self._buffer) >= 4 else 4
-            return (
-                f"incomplete worker frame: received {len(self._buffer)} of "
-                f"{needed} header bytes"
-            )
+            return f"incomplete worker frame: received {len(self._buffer)} of {needed} header bytes"
         return None
 
-    def receive(self, *, byte_budget=1024 * 1024):
+    def receive(self, *, byte_budget: int = 1024 * 1024) -> Iterator[object]:
         """Yield complete messages, reading at most byte_budget new bytes.
 
-        Storage grows only with bytes actually received, never with a claimed
-        frame length. The bounded read budget also lets the parent poll waitpid
-        while a worker or its descendants are producing output.
+        The buffer grows as bytes arrive, regardless of the claimed frame size.
+        The budget lets the parent keep checking for dead workers while data arrives.
         """
         received = 0
         while True:
@@ -72,22 +65,18 @@ class FramedReceiver:
                     elif size < 0:
                         raise TransportError(f"invalid worker frame length: {size}")
                     if size > sys.maxsize:
-                        raise TransportError(
-                            f"worker frame length exceeds platform limit: {size}"
-                        )
+                        raise TransportError(f"worker frame length exceeds platform limit: {size}")
                     del self._buffer[:header_size]
                     self._expected = size
                 if len(self._buffer) < self._expected:
                     break
-                # Decode only after a whole packet is present. A bounded view
-                # avoids an extra copy; release it before resizing the buffer.
+                # Decode the complete packet without copying it. Release the
+                # view before resizing the buffer.
                 payload = memoryview(self._buffer)[: self._expected]
                 try:
                     message = ForkingPickler.loads(payload)
                 except Exception as error:
-                    raise TransportError(
-                        f"invalid pickle in worker frame: {error}"
-                    ) from error
+                    raise TransportError(f"invalid pickle in worker frame: {error}") from error
                 finally:
                     payload.release()
                 del self._buffer[: self._expected]
@@ -96,13 +85,9 @@ class FramedReceiver:
             if self.eof or received >= byte_budget:
                 return
             try:
-                chunk = self._socket.recv(
-                    min(65536, byte_budget - received), socket.MSG_DONTWAIT
-                )
+                chunk = self._socket.recv(min(65536, byte_budget - received), socket.MSG_DONTWAIT)
             except BlockingIOError:
                 return
-            except InterruptedError:
-                continue
             except OSError as error:
                 raise TransportError(f"cannot read worker socket: {error}") from error
             if not chunk:

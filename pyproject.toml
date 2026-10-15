@@ -38,11 +38,18 @@ bistra = "bistra.cli:main"
 
 [dependency-groups]
 dev = [
+    { include-group = "test" },
+    { include-group = "lint" },
+    { include-group = "type" },
+    { include-group = "package" },
+    "pre-commit>=4.7,<5",
     "pytest==8.4.2",
-    "pytest-xdist==3.8.0",
-    "pytest-asyncio==1.3.0",
-    "tox>=4.22,<5",
+    "tox>=4.65,<5",
 ]
+test = ["pytest-xdist==3.8.0"]
+lint = ["ruff>=0.17,<0.18"]
+type = ["ty>=0.0.88,<0.1"]
+package = ["build>=1.6,<2", "twine>=7,<8"]
 
 [tool.setuptools.packages.find]
 where = ["src"]
@@ -50,3 +57,117 @@ include = ["bistra*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+
+[tool.ruff]
+target-version = "py311"
+line-length = 120
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F", "I", "UP", "B"]
+
+[tool.ty.environment]
+python-version = "3.11"
+
+[tool.ty.src]
+include = ["src"]
+
+[tool.ty.rules]
+unused-ignore-comment = "error"
+unused-type-ignore-comment = "error"
+
+[tool.tox]
+requires = ["tox>=4.65,<5"]
+env_list = [
+    "py311-pytestmin",
+    { product = [
+        [
+            "py311",
+            "py312",
+            "py313",
+            "py314",
+            "py315",
+        ],
+        [
+            "pytestlatest",
+        ],
+    ] },
+    "lint",
+    "type",
+    "package",
+]
+
+[tool.tox.env_run_base]
+description = "Test the installed wheel"
+package = "wheel"
+dependency_groups = ["test"]
+deps = [
+    { replace = "if", condition = "factor.pytestmin", then = [
+        "pytest==8.4.2",
+    ], else = [
+        "pytest>=8.4.2,<10",
+    ], extend = true },
+]
+commands = [
+    [
+        "python",
+        "-m",
+        "pytest",
+        { replace = "posargs", default = [
+            "tests",
+        ], extend = true },
+    ],
+]
+
+[tool.tox.env.lint]
+description = "Check lint rules and formatting"
+package = "skip"
+dependency_groups = ["lint"]
+deps = []
+commands = [
+    [
+        "python",
+        "-m",
+        "ruff",
+        "check",
+        "src",
+        "tests",
+    ],
+    [
+        "python",
+        "-m",
+        "ruff",
+        "format",
+        "--check",
+        "src",
+        "tests",
+    ],
+]
+
+[tool.tox.env.type]
+description = "Check types"
+dependency_groups = ["type"]
+deps = []
+commands = [["ty", "check", "--python", "{env_python}"]]
+
+[tool.tox.env.package]
+description = "Build and check distributions"
+package = "skip"
+dependency_groups = ["package"]
+deps = []
+commands = [
+    [
+        "python",
+        "-m",
+        "build",
+        "--outdir",
+        "{env_tmp_dir}/dist",
+    ],
+    [
+        "python",
+        "-m",
+        "twine",
+        "check",
+        "--strict",
+        "{env_tmp_dir}/dist/*",
+    ],
+]

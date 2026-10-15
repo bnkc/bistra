@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 import hashlib
 import json
 import os
@@ -9,11 +7,10 @@ import textwrap
 from collections import Counter
 
 import pytest
+
 from bistra.durations import load_history, save_history
 
-pytestmark = pytest.mark.skipif(
-    not hasattr(os, "fork"), reason="requires POSIX workers"
-)
+pytestmark = pytest.mark.skipif(os.name != "posix", reason="parallel workers require POSIX")
 
 
 def _history_path(tmp_path):
@@ -21,16 +18,11 @@ def _history_path(tmp_path):
     return tmp_path / "cache" / "bistra" / f"{key}.json"
 
 
-def _run(tmp_path, *, run="run", workers=2):
+def _run(tmp_path, subprocess_env, *, run="run", workers=2):
     (tmp_path / "pytest.ini").write_text("[pytest]\n")
     records = tmp_path / run
     records.mkdir()
-    env = os.environ.copy()
-    env.pop("PYTEST_PLUGINS", None)
-    env["PYTEST_ADDOPTS"] = ""
-    env["PYTEST_DISABLE_PLUGIN_AUTOLOAD"] = "1"
-    env["XDG_CACHE_HOME"] = str(tmp_path / "cache")
-    env["TEST_RECORDS"] = str(records)
+    env = {**subprocess_env, "TEST_RECORDS": str(records)}
     result = subprocess.run(
         [sys.executable, "-m", "bistra", f"-j{workers}", "--", "-q"],
         cwd=tmp_path,
@@ -49,14 +41,13 @@ def _assert_complete_history(tmp_path, nodeids):
     for phases in history.values():
         assert set(phases) == {"total", "setup", "call", "teardown"}
         assert all(value >= 0 for value in phases.values())
-        assert phases["total"] >= sum(
-            phases[phase] for phase in ("setup", "call", "teardown")
-        )
+        assert phases["total"] >= sum(phases[phase] for phase in ("setup", "call", "teardown"))
     return history
 
 
 def test_learns_parametrized_durations_then_starts_expensive_tests_on_separate_workers(
     tmp_path,
+    subprocess_env,
 ):
     (tmp_path / "test_cases.py").write_text(
         textwrap.dedent("""
@@ -96,7 +87,7 @@ def test_learns_parametrized_durations_then_starts_expensive_tests_on_separate_w
         "test_cases.py::test_expensive[slower]",
     ]
     assert not _history_path(tmp_path).exists()
-    cold = _run(tmp_path, run="cold")
+    cold = _run(tmp_path, subprocess_env, run="cold")
     history = _assert_complete_history(tmp_path, nodeids)
     assert all(value > 0 for phases in history.values() for value in phases.values())
     assert history[nodeids[-1]]["call"] > history[nodeids[0]]["call"]
@@ -106,7 +97,7 @@ def test_learns_parametrized_durations_then_starts_expensive_tests_on_separate_w
     )
     assert "test_cheap" in cold_records[0]["nodeid"]
 
-    warm = _run(tmp_path, run="warm")
+    warm = _run(tmp_path, subprocess_env, run="warm")
     warm_records = sorted(
         (json.loads(path.read_text()) for path in warm.iterdir()),
         key=lambda row: row["start"],
@@ -120,7 +111,7 @@ def test_learns_parametrized_durations_then_starts_expensive_tests_on_separate_w
     _assert_complete_history(tmp_path, nodeids)
 
 
-def test_history_includes_original_and_fresh_worker_protocol_phases(tmp_path):
+def test_history_includes_original_and_fresh_worker_protocol_phases(tmp_path, subprocess_env):
     (tmp_path / "test_cases.py").write_text(
         textwrap.dedent("""
         import json
@@ -153,19 +144,16 @@ def test_history_includes_original_and_fresh_worker_protocol_phases(tmp_path):
             time.sleep(0.01)
     """)
     )
-    records = _run(tmp_path)
+    records = _run(tmp_path, subprocess_env)
     rows = [json.loads(path.read_text()) for path in records.iterdir()]
     assert len(rows) == 4
-    assert all(
-        row["pid"] == row["collector"] for row in rows if "test_parent" in row["nodeid"]
-    )
     assert all(row["pid"] == row["collector"] for row in rows)
     assert len({row["pid"] for row in rows}) == 2
     history = _assert_complete_history(tmp_path, [row["nodeid"] for row in rows])
     assert all(value > 0 for phases in history.values() for value in phases.values())
 
 
-def test_long_test_does_not_reserve_expensive_followup_behind_it(tmp_path):
+def test_long_test_does_not_reserve_expensive_followup_behind_it(tmp_path, subprocess_env):
     (tmp_path / "conftest.py").write_text(
         textwrap.dedent("""
         import json
@@ -236,11 +224,9 @@ def test_long_test_does_not_reserve_expensive_followup_behind_it(tmp_path):
         "test_remaining.py::test_tiny": {"total": 0.001},
     }
     save_history(_history_path(tmp_path), history)
-    records = _run(tmp_path)
+    records = _run(tmp_path, subprocess_env)
     executions = [
-        json.loads(line)
-        for path in records.glob("executions-*.jsonl")
-        for line in path.read_text().splitlines()
+        json.loads(line) for path in records.glob("executions-*.jsonl") for line in path.read_text().splitlines()
     ]
     assert Counter(executions) == Counter(history.keys())
     assert json.loads((records / "overlapped.json").read_text()), (
@@ -256,6 +242,7 @@ def test_long_test_does_not_reserve_expensive_followup_behind_it(tmp_path):
 
 def test_warm_scheduling_preserves_scoped_fixture_lifetimes_and_consumer_order(
     tmp_path,
+    subprocess_env,
 ):
     package = tmp_path / "cases"
     package.mkdir()
@@ -326,15 +313,12 @@ def test_warm_scheduling_preserves_scoped_fixture_lifetimes_and_consumer_order(
     history = {
         f"{nodeid}[{value}]": {"total": cost}
         for value in ("red", "blue")
-        for nodeid, cost in zip(cases, (1, 10, 2, 20))
+        for nodeid, cost in zip(cases, (1, 10, 2, 20), strict=True)
     }
     history["test_unrelated.py::test_independent"] = {"total": 15}
     save_history(_history_path(tmp_path), history)
-    records = _run(tmp_path)
-    rows = [
-        json.loads(line)
-        for line in (records / "lifecycle.jsonl").read_text().splitlines()
-    ]
+    records = _run(tmp_path, subprocess_env)
+    rows = [json.loads(line) for line in (records / "lifecycle.jsonl").read_text().splitlines()]
     fixtures = [row for row in rows if row["kind"] == "fixture"]
     expected = Counter(
         (scope, owner, value, phase)
@@ -348,23 +332,16 @@ def test_warm_scheduling_preserves_scoped_fixture_lifetimes_and_consumer_order(
         for value in ("red", "blue")
         for phase in ("setup", "teardown")
     )
-    assert (
-        Counter(
-            (row["scope"], row["owner"], row["value"], row["phase"]) for row in fixtures
-        )
-        == expected
-    )
+    assert Counter((row["scope"], row["owner"], row["value"], row["phase"]) for row in fixtures) == expected
     for value in ("red", "blue"):
         calls = [row for row in rows if row["kind"] == "test" and row["value"] == value]
-        assert [row["nodeid"] for row in calls] == [
-            f"{nodeid}[{value}]" for nodeid in cases
-        ]
+        assert [row["nodeid"] for row in calls] == [f"{nodeid}[{value}]" for nodeid in cases]
         assert len({row["pid"] for row in calls}) == 1
     _assert_complete_history(tmp_path, history)
 
 
 @pytest.mark.parametrize("fixture_kind", ["indirect-module", "package-fallback"])
-def test_warm_groups_follow_effective_fixture_scope(tmp_path, fixture_kind):
+def test_warm_groups_follow_effective_fixture_scope(tmp_path, subprocess_env, fixture_kind):
     declaration = (
         "@pytest.fixture"
         if fixture_kind == "indirect-module"
@@ -411,11 +388,8 @@ def test_warm_groups_follow_effective_fixture_scope(tmp_path, fixture_kind):
         for name, cost in (("first", 100), ("second", 1), ("third", 20))
     }
     save_history(_history_path(tmp_path), history)
-    records = _run(tmp_path)
-    rows = [
-        json.loads(line)
-        for line in (records / "lifecycle.jsonl").read_text().splitlines()
-    ]
+    records = _run(tmp_path, subprocess_env)
+    rows = [json.loads(line) for line in (records / "lifecycle.jsonl").read_text().splitlines()]
     for value in ("red", "blue"):
         events = [row for row in rows if row["value"] == value]
         assert [row["phase"] for row in events] == [
@@ -426,7 +400,6 @@ def test_warm_groups_follow_effective_fixture_scope(tmp_path, fixture_kind):
             "teardown",
         ]
         assert [row["nodeid"] for row in events if row["phase"] == "call"] == [
-            f"test_cases.py::test_{name}[{value}]"
-            for name in ("first", "second", "third")
+            f"test_cases.py::test_{name}[{value}]" for name in ("first", "second", "third")
         ]
         assert len({row["pid"] for row in events}) == 1

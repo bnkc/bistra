@@ -1,28 +1,17 @@
-"""Command-line entry point for the opt-in pytest plugin."""
-
-from __future__ import annotations
+"""Run pytest with Bistra enabled."""
 
 import argparse
 import sys
 
 from . import __version__
-from .workers import DEFAULT_WORKERS
-
-
-class _PluginLoader:
-    def pytest_addhooks(self, pluginmanager):
-        from . import plugin
-
-        # Use the installed entry-point name so subsequent autoload skips it.
-        if not pluginmanager.hasplugin("bistra"):
-            pluginmanager.register(plugin, name="bistra")
+from .options import DEFAULT_WORKERS, parse_worker_count
 
 
 def main(argv: list[str] | None = None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
     parser = argparse.ArgumentParser(
         prog="bistra",
-        description="Run pytest in fresh interpreters with automatic duration-aware scheduling.",
+        description="Run pytest in parallel, using past timings to schedule slower tests first.",
         epilog="Pass pytest arguments after --, for example: bistra -j 4 -- -q tests/",
         allow_abbrev=False,
     )
@@ -30,8 +19,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "-j",
         "--workers",
-        type=int,
-        help=f"worker processes (default: {DEFAULT_WORKERS})",
+        type=parse_worker_count,
+        help=f"worker processes (default: {DEFAULT_WORKERS}; 1 runs serially)",
     )
     if "--" in argv:
         separator = argv.index("--")
@@ -39,13 +28,10 @@ def main(argv: list[str] | None = None) -> int:
         forwarded.extend(argv[separator + 1 :])
     else:
         options, forwarded = parser.parse_known_args(argv)
-    if options.workers is not None and options.workers < 1:
-        parser.error("worker count must be positive")
-
-    pytest_args = ["--bistra"]
+    pytest_args = ["-p", "bistra", "--bistra"]
     if options.workers is not None:
         pytest_args.extend(("--bistra-workers", str(options.workers)))
 
     import pytest
 
-    return int(pytest.main([*pytest_args, *forwarded], plugins=[_PluginLoader()]))
+    return int(pytest.main([*pytest_args, *forwarded]))

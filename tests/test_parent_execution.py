@@ -1,7 +1,4 @@
-from __future__ import annotations
-
 import json
-import os
 import subprocess
 import sys
 import textwrap
@@ -10,11 +7,8 @@ from collections import Counter
 from pathlib import Path
 
 
-def run_pytest(tmp_path, *, workers=2, args=(), environment=None):
-    env = os.environ.copy()
-    env["PYTEST_DISABLE_PLUGIN_AUTOLOAD"] = "1"
-    env["XDG_CACHE_HOME"] = str(tmp_path / "cache")
-    env.update(environment or {})
+def run_pytest(tmp_path, subprocess_env, *, workers=2, args=(), environment=None):
+    env = {**subprocess_env, **(environment or {})}
     (tmp_path / "pytest.ini").write_text("[pytest]\n")
     return subprocess.run(
         [
@@ -37,7 +31,7 @@ def run_pytest(tmp_path, *, workers=2, args=(), environment=None):
     )
 
 
-def test_original_and_fresh_interpreter_overlap_on_their_main_threads(tmp_path):
+def test_original_and_fresh_interpreter_overlap_on_their_main_threads(tmp_path, subprocess_env):
     (tmp_path / "conftest.py").write_text(
         textwrap.dedent("""
         import threading
@@ -77,7 +71,7 @@ def test_original_and_fresh_interpreter_overlap_on_their_main_threads(tmp_path):
             }))
     """)
     )
-    result = run_pytest(tmp_path, args=("--strict-markers",))
+    result = run_pytest(tmp_path, subprocess_env, args=("--strict-markers",))
     assert result.returncode == 0, result.stdout + result.stderr
     assert "20 passed" in result.stdout
     records = [json.loads(path.read_text()) for path in tmp_path.glob("context-*.json")]
@@ -89,15 +83,20 @@ def test_original_and_fresh_interpreter_overlap_on_their_main_threads(tmp_path):
     assert len({str(Path(row["basetemp"]).parent) for row in records}) == 1
 
 
-def test_parent_reports_capture_and_fixture_lifetimes_match_serial(tmp_path):
+def test_parent_reports_capture_and_fixture_lifetimes_match_serial(tmp_path, subprocess_env):
     (tmp_path / "test_parent.py").write_text(
         textwrap.dedent("""
         import json
+        import multiprocessing
         import os
         import threading
         import pytest
 
         COLLECTION_PID = os.getpid()
+
+        @pytest.fixture(autouse=True)
+        def assert_original_process():
+            assert multiprocessing.parent_process() is None
 
         def record(scope, phase):
             with open(os.environ["LIFECYCLE_RECORD"], "a") as output:
@@ -156,9 +155,14 @@ def test_parent_reports_capture_and_fixture_lifetimes_match_serial(tmp_path):
             assert False
     """)
     )
-    (tmp_path / "test_worker.py").write_text(
+    # The first fixture group goes to the child; the second goes to the parent.
+    (tmp_path / "test_00_worker.py").write_text(
         textwrap.dedent("""
         import pytest
+
+        @pytest.fixture(scope="module", autouse=True)
+        def keep_worker_group_together():
+            yield
 
         @pytest.mark.parametrize("index", range(4))
         def test_worker(index):
@@ -166,11 +170,12 @@ def test_parent_reports_capture_and_fixture_lifetimes_match_serial(tmp_path):
     """)
     )
     outcomes = []
-    for workers in (1, 3):
+    for workers in (1, 2):
         xml = tmp_path / f"result-{workers}.xml"
         lifecycle = tmp_path / f"lifecycle-{workers}.jsonl"
         result = run_pytest(
             tmp_path,
+            subprocess_env,
             workers=workers,
             args=("--strict-markers", f"--junitxml={xml}"),
             environment={"LIFECYCLE_RECORD": str(lifecycle)},
@@ -190,11 +195,7 @@ def test_parent_reports_capture_and_fixture_lifetimes_match_serial(tmp_path):
                 (
                     case.get("classname"),
                     case.get("name"),
-                    tuple(
-                        child.tag
-                        for child in case
-                        if child.tag in ("failure", "error", "skipped")
-                    ),
+                    tuple(child.tag for child in case if child.tag in ("failure", "error", "skipped")),
                 )
                 for case in ET.parse(xml).iter("testcase")
             )
@@ -211,15 +212,17 @@ def test_parent_reports_capture_and_fixture_lifetimes_match_serial(tmp_path):
     assert sum(outcomes[1].values()) == 12
 
 
-def test_parent_failfast_stops_pending_parent_tests_and_finalizes(tmp_path):
+def test_parent_failfast_stops_pending_parent_tests_and_finalizes(tmp_path, subprocess_env):
     (tmp_path / "test_parent.py").write_text(
         textwrap.dedent("""
+        import multiprocessing
         from pathlib import Path
         import pytest
 
 
         @pytest.fixture(scope="module", autouse=True)
         def cleanup():
+            assert multiprocessing.parent_process() is None
             yield
             Path("parent-cleaned-up").write_text("yes")
 
@@ -230,16 +233,21 @@ def test_parent_failfast_stops_pending_parent_tests_and_finalizes(tmp_path):
             Path("unexpected-parent-test").write_text("ran")
     """)
     )
-    (tmp_path / "test_worker.py").write_text(
+    # Reserve the earlier module for the child, leaving the failure in the parent.
+    (tmp_path / "test_00_worker.py").write_text(
         textwrap.dedent("""
         import pytest
+
+        @pytest.fixture(scope="module", autouse=True)
+        def keep_worker_group_together():
+            yield
 
         @pytest.mark.parametrize("index", range(20))
         def test_worker(index):
             assert index >= 0
     """)
     )
-    result = run_pytest(tmp_path, args=("-x",))
+    result = run_pytest(tmp_path, subprocess_env, args=("-x",))
     assert result.returncode == 1, result.stdout + result.stderr
     assert "parent failfast evidence" in result.stdout
     assert "1 failed" in result.stdout

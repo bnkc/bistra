@@ -1,41 +1,34 @@
-"""Prioritize expensive test groups while preserving order inside each group."""
-
-from __future__ import annotations
+"""Prioritize slower test groups without reordering tests within a group."""
 
 import heapq
 import math
 from collections import deque
 from collections.abc import Mapping, Sequence
+from typing import SupportsFloat, SupportsIndex, cast
 
 
 def _valid_duration(value: object) -> float | None:
-    # Booleans usually indicate corrupt metadata, not a measured duration.
+    # Reject booleans even though Python treats them as numbers.
     if isinstance(value, bool):
         return None
     try:
-        number = float(value)
+        number = float(cast(str | bytes | bytearray | SupportsFloat | SupportsIndex, value))
     except (TypeError, ValueError, OverflowError):
         return None
     return number if math.isfinite(number) and number >= 0 else None
 
 
-def estimate_durations(
-    indices: Sequence[int], durations: Mapping[int, object]
-) -> dict[int, float]:
-    """Fill missing estimates using the selected tests' positive mean."""
+def estimate_durations(indices: Sequence[int], durations: Mapping[int, object]) -> dict[int, float]:
+    """Fill missing estimates with the mean of the selected tests' positive timings."""
     known = {index: _valid_duration(durations.get(index)) for index in indices}
     positive = [value for value in known.values() if value is not None and value > 0]
     if positive:
-        # Scale before averaging so finite observations cannot overflow the sum.
+        # Scale before averaging to avoid overflow when adding large durations.
         scale = max(positive)
-        fallback = (
-            math.fsum(value / scale for value in positive) / len(positive) * scale
-        )
+        fallback = math.fsum(value / scale for value in positive) / len(positive) * scale
     else:
         fallback = 1.0
-    weights = {
-        index: fallback if value is None else value for index, value in known.items()
-    }
+    weights = {index: fallback if value is None else value for index, value in known.items()}
     try:
         total = math.fsum(weights.values())
     except OverflowError as exc:
@@ -45,16 +38,13 @@ def estimate_durations(
     return weights
 
 
-def prioritize_groups(
-    groups: Sequence[Sequence[int]], durations: Mapping[int, object]
-) -> list[list[int]]:
-    """Put expensive indivisible groups first, preserving order within groups.
+def prioritize_groups(groups: Sequence[Sequence[int]], durations: Mapping[int, object]) -> list[list[int]]:
+    """Put slower groups first without reordering their tests.
 
-    Equal-cost groups retain their input order.  Unknown or invalid durations
-    use the mean of positive observations for the supplied tests, or 1.0 seconds
-    without positive observations.  Zero remains a valid measurement, and stale
-    history does not affect the estimate.  Groups must be nonempty and test
-    indices must be unique across all groups.
+    Ties keep their input order. Missing or invalid timings use the mean of
+    positive timings from the selected tests, or one second if none are known.
+    Zero is valid; history for other tests is ignored. Groups must be nonempty,
+    and each test index must appear only once.
     """
     ordered = [list(group) for group in groups]
     if any(not group for group in ordered):
@@ -64,35 +54,26 @@ def prioritize_groups(
         raise ValueError("job identifiers must be unique")
     weights = estimate_durations(indices, durations)
 
-    costs = [math.fsum(weights[index] for index in group) for group in ordered]
-    return [
-        ordered[position]
-        for position in sorted(
-            range(len(ordered)), key=lambda position: -costs[position]
-        )
-    ]
+    return sorted(ordered, key=lambda group: -math.fsum(weights[index] for index in group))
 
 
 class GroupQueue:
-    """Take whole groups by supplied priority or shortest estimated duration."""
+    """Take whole groups in priority order or by shortest estimated duration."""
 
-    def __init__(self, groups, estimates):
+    def __init__(self, groups: Sequence[Sequence[int]], estimates: Mapping[int, float]) -> None:
         self._groups = {rank: list(group) for rank, group in enumerate(groups)}
         self._priority = deque(self._groups)
         self._shortest = (
-            [
-                (math.fsum(estimates[index] for index in group), rank)
-                for rank, group in self._groups.items()
-            ]
+            [(math.fsum(estimates[index] for index in group), rank) for rank, group in self._groups.items()]
             if estimates
             else []
         )
         heapq.heapify(self._shortest)
 
-    def __len__(self):
+    def __len__(self) -> int:
         return len(self._groups)
 
-    def take(self, *, shortest=False):
+    def take(self, *, shortest: bool = False) -> list[int] | None:
         if not self._groups:
             return None
         if shortest and self._shortest:

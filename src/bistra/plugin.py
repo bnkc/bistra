@@ -1,23 +1,10 @@
-"""Pytest entry point. Installation alone never enables the parallel runner."""
+"""Pytest hooks and fixtures. Parallel execution requires --bistra."""
 
-from __future__ import annotations
-
-import argparse
 import os
 
 import pytest
 
-from .workers import DEFAULT_WORKERS
-
-
-def _positive_int(value: str) -> int:
-    try:
-        number = int(value)
-    except ValueError:
-        raise argparse.ArgumentTypeError("must be a positive integer") from None
-    if number < 1:
-        raise argparse.ArgumentTypeError("must be a positive integer")
-    return number
+from .options import DEFAULT_WORKERS, parse_worker_count
 
 
 def pytest_addoption(parser):
@@ -25,16 +12,13 @@ def pytest_addoption(parser):
     group.addoption(
         "--bistra",
         action="store_true",
-        help="enable bistra's fresh interpreter workers",
+        help="run tests in parallel with Bistra",
     )
     group.addoption(
         "--bistra-workers",
-        type=_positive_int,
+        type=parse_worker_count,
         default=DEFAULT_WORKERS,
-        help=(
-            f"worker processes (default: {DEFAULT_WORKERS}; "
-            "1 uses ordinary pytest execution)"
-        ),
+        help=(f"worker processes (default: {DEFAULT_WORKERS}; 1 runs serially)"),
     )
 
 
@@ -48,13 +32,13 @@ def pytest_load_initial_conftests(early_config, parser, args):
 
 @pytest.fixture(scope="session")
 def worker_id(request):
-    """Expose the execution slot using the established parallel-fixture convention."""
+    """Return this worker's ID, or 'master' for serial runs."""
     return getattr(request.config, "workerinput", {}).get("workerid", "master")
 
 
 @pytest.fixture(scope="session")
 def testrun_uid(request):
-    """Share a run identity across workers without requiring pytest-xdist."""
+    """Return a test-run ID shared by all workers."""
     context = getattr(request.config, "workerinput", None)
     return context["testrunuid"] if context is not None else os.urandom(16).hex()
 

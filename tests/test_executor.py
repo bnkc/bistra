@@ -1,18 +1,16 @@
-from __future__ import annotations
-
 import multiprocessing
 import os
 import threading
 import time
 
 import pytest
+from executor_helpers import unexpected_parent, worker_starter
+
 from bistra.executor import WorkerStop, execute_parallel
 
 
 @pytest.mark.parametrize("states", ["42 Z\n77 S\n", "77 S\n"])
-def test_permission_error_for_a_dead_group_is_not_a_cleanup_failure(
-    monkeypatch, states
-):
+def test_permission_error_for_a_dead_group_is_not_a_cleanup_failure(monkeypatch, states):
     from bistra import executor
 
     def denied(*args):
@@ -30,9 +28,7 @@ def test_permission_error_for_a_live_group_is_not_hidden(monkeypatch):
         raise PermissionError("real permission failure")
 
     monkeypatch.setattr(executor.os, "killpg", denied)
-    monkeypatch.setattr(
-        executor.subprocess, "check_output", lambda *a, **k: "42 Z\n42 S\n"
-    )
+    monkeypatch.setattr(executor.subprocess, "check_output", lambda *a, **k: "42 Z\n42 S\n")
     with pytest.raises(PermissionError, match="real permission failure"):
         executor._signal_group(42, 0)
 
@@ -46,6 +42,22 @@ class Recorder:
 
     def finalize(self, emit):
         emit({"type": "finalized"})
+
+
+def parent_recorder(on_event, worker_id):
+    def execute(index, next_index):
+        event = {
+            "type": "value",
+            "value": index,
+            "next": next_index,
+            "pid": os.getpid(),
+            "worker_id": worker_id,
+            "index": index,
+        }
+        if on_event(event) is False:
+            raise WorkerStop("parent callback requested stop", completed=True)
+
+    return execute
 
 
 class Crasher(Recorder):
@@ -69,7 +81,12 @@ class StopWithBrokenCleanup(BrokenFinalizer):
 def test_cleanup_error_during_controlled_stop_is_a_crash():
     events = []
     result = execute_parallel(
-        StopWithBrokenCleanup(), [0], workers=1, on_event=events.append
+        [0],
+        workers=2,
+        groups=[[0]],
+        start_worker=worker_starter(StopWithBrokenCleanup()),
+        parent_execute=unexpected_parent,
+        on_event=events.append,
     )
     assert not result.completed
     assert len(result.crashes) == 1
@@ -80,7 +97,12 @@ def test_cleanup_error_during_controlled_stop_is_a_crash():
 def test_failed_finalizer_is_not_invoked_twice():
     events = []
     result = execute_parallel(
-        BrokenFinalizer(), [0], workers=1, batch_size=1, on_event=events.append
+        [0],
+        workers=2,
+        groups=[[0]],
+        start_worker=worker_starter(BrokenFinalizer()),
+        parent_execute=unexpected_parent,
+        on_event=events.append,
     )
     assert result.completed == {0}
     assert len(result.crashes) == 1
@@ -92,10 +114,11 @@ def test_exactly_once_and_worker_lookahead():
     events = []
     completions = []
     result = execute_parallel(
-        Recorder(),
         list(range(37)),
         workers=3,
-        batch_size=4,
+        groups=[list(range(start, min(start + 4, 37))) for start in range(0, 37, 4)],
+        start_worker=worker_starter(Recorder()),
+        parent_execute=parent_recorder(events.append, 2),
         on_event=events.append,
         on_complete=lambda index, elapsed: completions.append((index, elapsed)),
     )
@@ -104,18 +127,22 @@ def test_exactly_once_and_worker_lookahead():
     assert sorted(i for i, _ in completions) == list(range(37))
     values = [e for e in events if e["type"] == "value"]
     assert sorted(e["value"] for e in values) == list(range(37))
-    assert all(e["pid"] != os.getpid() for e in values)
+    assert any(e["pid"] == os.getpid() for e in values)
+    assert any(e["pid"] != os.getpid() for e in values)
     for worker in {e["worker_id"] for e in values}:
         sequence = [e for e in values if e["worker_id"] == worker]
-        assert [e["next"] for e in sequence] == [e["value"] for e in sequence[1:]] + [
-            None
-        ]
-    assert len([e for e in events if e["type"] == "finalized"]) == 3
+        assert [e["next"] for e in sequence] == [e["value"] for e in sequence[1:]] + [None]
+    assert len([e for e in events if e["type"] == "finalized"]) == 2
 
 
 def test_crashed_worker_cannot_appear_successful():
     result = execute_parallel(
-        Crasher(), list(range(12)), workers=2, batch_size=2, on_event=lambda event: None
+        list(range(12)),
+        workers=2,
+        groups=[list(range(12))],
+        start_worker=worker_starter(Crasher()),
+        parent_execute=unexpected_parent,
+        on_event=lambda event: None,
     )
     assert result.crashes
     assert 0 not in result.completed
@@ -130,7 +157,12 @@ def test_failfast_accounts_for_completed_work():
         return False
 
     result = execute_parallel(
-        Recorder(), list(range(100)), workers=2, batch_size=1, on_event=stop
+        list(range(100)),
+        workers=2,
+        groups=[[index] for index in range(100)],
+        start_worker=worker_starter(Recorder()),
+        parent_execute=parent_recorder(stop, 1),
+        on_event=stop,
     )
     assert result.stopped
     assert len(result.completed) < 100
@@ -141,7 +173,12 @@ def test_dispatch_groups_preserve_local_order_and_exact_lookahead():
     groups = [[6, 7, 8], [3, 4, 5], [0, 1, 2], [9]]
     events = []
     result = execute_parallel(
-        Recorder(), list(range(10)), workers=3, groups=groups, on_event=events.append
+        list(range(10)),
+        workers=3,
+        groups=groups,
+        start_worker=worker_starter(Recorder()),
+        parent_execute=parent_recorder(events.append, 2),
+        on_event=events.append,
     )
     assert result.completed == set(range(10))
     assert not result.crashes
@@ -153,25 +190,22 @@ def test_dispatch_groups_preserve_local_order_and_exact_lookahead():
         assert len({event["worker_id"] for event in records}) == 1
     for worker in {event["worker_id"] for event in values}:
         records = [event for event in values if event["worker_id"] == worker]
-        assert [event["next"] for event in records] == [
-            event["value"] for event in records[1:]
-        ] + [None]
+        assert [event["next"] for event in records] == [event["value"] for event in records[1:]] + [None]
     assert groups == [[6, 7, 8], [3, 4, 5], [0, 1, 2], [9]]
 
 
 def test_group_order_refers_to_supplied_indices_not_numeric_sort():
     events = []
     result = execute_parallel(
-        Recorder(),
         [5, 1, 8, 2, 9],
         workers=2,
         groups=[[5, 8, 9], [1, 2]],
+        start_worker=worker_starter(Recorder()),
+        parent_execute=parent_recorder(events.append, 1),
         on_event=events.append,
     )
     assert result.completed == {5, 1, 8, 2, 9}
-    assert [
-        e["value"] for e in events if e["type"] == "value" and e["worker_id"] == 0
-    ] == [5, 8, 9]
+    assert [e["value"] for e in events if e["type"] == "value" and e["worker_id"] == 0] == [5, 8, 9]
 
 
 @pytest.mark.parametrize(
@@ -187,7 +221,12 @@ def test_group_order_refers_to_supplied_indices_not_numeric_sort():
 def test_invalid_groups_are_rejected_before_starting_workers(groups, fragment):
     with pytest.raises(ValueError, match=fragment):
         execute_parallel(
-            Recorder(), [0, 1, 2], workers=2, groups=groups, on_event=lambda event: None
+            [0, 1, 2],
+            workers=2,
+            groups=groups,
+            start_worker=lambda *args: pytest.fail("invalid groups must not start a worker"),
+            parent_execute=unexpected_parent,
+            on_event=lambda event: None,
         )
 
 
@@ -229,24 +268,11 @@ def _start_after_parent(connection, worker_id, adapter, initial):
 def test_long_parent_reserves_tiny_followup_and_leaves_whole_group_for_child(
     tmp_path,
 ):
-    context = multiprocessing.get_context("spawn")
     adapter = ReservationRecorder(tmp_path)
     events = []
     parent_calls = []
     completions = []
     groups = [[0], [1], [2, 3], [4]]
-
-    def start_worker(worker_id, initial):
-        parent, child = context.Pipe(duplex=True)
-        process = context.Process(
-            target=_start_after_parent,
-            args=(child, worker_id, adapter, initial),
-        )
-        try:
-            process.start()
-        finally:
-            child.close()
-        return process, parent
 
     def parent_execute(index, next_index):
         parent_calls.append((index, next_index))
@@ -255,12 +281,11 @@ def test_long_parent_reserves_tiny_followup_and_leaves_whole_group_for_child(
             _wait_for_file(tmp_path / "medium-started")
 
     result = execute_parallel(
-        adapter,
         list(range(5)),
         workers=2,
         groups=groups,
         estimates={0: 1, 1: 100, 2: 3, 3: 3, 4: 0.001},
-        start_worker=start_worker,
+        start_worker=worker_starter(adapter, target=_start_after_parent),
         parent_execute=parent_execute,
         on_event=events.append,
         on_complete=lambda index, elapsed: completions.append(index),
@@ -280,10 +305,8 @@ def test_long_parent_reserves_tiny_followup_and_leaves_whole_group_for_child(
     assert groups == [[0], [1], [2, 3], [4]]
 
 
-@pytest.mark.parametrize("grouped", [False, True])
-def test_parent_overlaps_children_and_callbacks_stay_on_main_thread(
-    tmp_path, grouped, monkeypatch
-):
+@pytest.mark.parametrize("reverse_priority", [False, True])
+def test_parent_overlaps_children_and_callbacks_stay_on_main_thread(tmp_path, reverse_priority, monkeypatch):
     caller = threading.get_ident()
     parent_pid = os.getpid()
     indices = list(range(50))
@@ -295,9 +318,7 @@ def test_parent_overlaps_children_and_callbacks_stay_on_main_thread(
 
     def process_start(process):
         starts.append(threading.get_ident())
-        assert not any(
-            thread.name == "bistra-coordinator" for thread in threading.enumerate()
-        )
+        assert not any(thread.name == "bistra-coordinator" for thread in threading.enumerate())
         return original_start(process)
 
     monkeypatch.setattr(multiprocessing.process.BaseProcess, "start", process_start)
@@ -319,13 +340,12 @@ def test_parent_overlaps_children_and_callbacks_stay_on_main_thread(
         assert threading.get_ident() == caller
         completions.append(index)
 
-    groups = [[index] for index in reversed(indices)] if grouped else None
+    groups = [[index] for index in (reversed(indices) if reverse_priority else indices)]
     result = execute_parallel(
-        OverlapRecorder(tmp_path),
         indices,
         workers=3,
-        batch_size=1,
         groups=groups,
+        start_worker=worker_starter(OverlapRecorder(tmp_path)),
         parent_execute=parent_execute,
         on_event=event,
         on_complete=complete,
@@ -341,9 +361,7 @@ def test_parent_overlaps_children_and_callbacks_stay_on_main_thread(
     assert sorted(parent_order + [event["value"] for event in values]) == indices
     for worker in {event["worker_id"] for event in values}:
         sequence = [event for event in values if event["worker_id"] == worker]
-        assert [event["next"] for event in sequence] == [
-            event["value"] for event in sequence[1:]
-        ] + [None]
+        assert [event["next"] for event in sequence] == [event["value"] for event in sequence[1:]] + [None]
 
 
 @pytest.mark.parametrize("completed", [False, True])
@@ -355,10 +373,10 @@ def test_parent_controlled_stop_accounts_for_completion(completed):
         raise WorkerStop("parent requested stop", completed=completed)
 
     result = execute_parallel(
-        Recorder(),
         list(range(20)),
         workers=2,
-        batch_size=1,
+        groups=[[index] for index in range(20)],
+        start_worker=worker_starter(Recorder()),
         parent_execute=parent_execute,
         on_event=lambda event: None,
     )
@@ -387,9 +405,10 @@ def test_parent_exception_cleans_up_active_children(tmp_path, error):
 
     with pytest.raises(error, match="parent failed"):
         execute_parallel(
-            WaitingRecorder(pidfile),
             [0, 1],
             workers=2,
+            groups=[[0], [1]],
+            start_worker=worker_starter(WaitingRecorder(pidfile)),
             parent_execute=parent_execute,
             on_event=lambda event: None,
         )
@@ -400,10 +419,10 @@ def test_parent_exception_cleans_up_active_children(tmp_path, error):
 def test_one_slot_runs_all_jobs_in_parent():
     calls = []
     result = execute_parallel(
-        Recorder(),
         [0, 1, 2, 3],
         workers=1,
         groups=[[0, 1, 2, 3]],
+        start_worker=lambda *args: pytest.fail("one execution slot must not start a child"),
         parent_execute=lambda index, next_index: calls.append((index, next_index)),
         on_event=lambda event: pytest.fail("no child worker should run"),
     )
@@ -413,9 +432,10 @@ def test_one_slot_runs_all_jobs_in_parent():
 
 def test_child_crash_remains_a_failure_with_parent_execution():
     result = execute_parallel(
-        Crasher(),
         list(range(20)),
         workers=2,
+        groups=[[index] for index in range(20)],
+        start_worker=worker_starter(Crasher()),
         parent_execute=lambda index, next_index: None,
         on_event=lambda event: None,
     )

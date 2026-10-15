@@ -27,9 +27,8 @@ dist/
 coverage.xml
 htmlcov/
 
-# Linter and type-checker caches
+# Linter cache
 .ruff_cache/
-.mypy_cache/
 
 # Local editor and macOS files
 .idea/

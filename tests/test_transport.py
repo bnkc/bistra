@@ -8,8 +8,9 @@ import sys
 import textwrap
 from multiprocessing.reduction import ForkingPickler
 
-import bistra.executor as executor
 import pytest
+from executor_helpers import unexpected_parent, worker_starter
+
 from bistra.executor import _message_parts, execute_parallel
 from bistra.transport import FramedReceiver, TransportError
 
@@ -28,9 +29,7 @@ def channel():
 
 def frame(value, *, extended=False):
     body = bytes(ForkingPickler.dumps(value))
-    header = (
-        struct.pack("!iQ", -1, len(body)) if extended else struct.pack("!i", len(body))
-    )
+    header = struct.pack("!iQ", -1, len(body)) if extended else struct.pack("!i", len(body))
     return header + body
 
 
@@ -62,10 +61,7 @@ def test_huge_advertised_body_only_stores_received_bytes(channel):
     _, child, receiver = channel
     os.write(child.fileno(), struct.pack("!iQ", -1, sys.maxsize) + b"abc")
     assert list(receiver.receive()) == []
-    assert (
-        receiver.incomplete
-        == f"incomplete worker frame: received 3 of {sys.maxsize} payload bytes"
-    )
+    assert receiver.incomplete == f"incomplete worker frame: received 3 of {sys.maxsize} payload bytes"
     assert len(receiver._buffer) == 3
 
 
@@ -127,7 +123,14 @@ class LargeReport:
 def test_large_normal_report_spans_receive_budgets():
 
     events = []
-    result = execute_parallel(LargeReport(), [0], workers=1, on_event=events.append)
+    result = execute_parallel(
+        [0],
+        workers=2,
+        groups=[[0]],
+        start_worker=worker_starter(LargeReport()),
+        parent_execute=unexpected_parent,
+        on_event=events.append,
+    )
     assert result.completed == {0}
     assert not result.crashes
     assert len(events) == 1
@@ -141,18 +144,23 @@ def malformed_worker(connection, worker_id, adapter, initial):
     os._exit(0)
 
 
-def test_invalid_worker_protocol_is_reported_as_crash(monkeypatch):
-
-    monkeypatch.setattr(executor, "_worker", malformed_worker)
-    result = execute_parallel(None, [0], workers=1, on_event=lambda event: None)
+def test_invalid_worker_protocol_is_reported_as_crash():
+    result = execute_parallel(
+        [0],
+        workers=2,
+        groups=[[0]],
+        start_worker=worker_starter(None, target=malformed_worker),
+        parent_execute=unexpected_parent,
+        on_event=lambda event: None,
+    )
     assert result.completed == set()
     assert len(result.crashes) == 1
     assert "unknown worker message" in result.crashes[0]["traceback"]
     assert result.crashes[0]["uncompleted"] == [0]
 
 
-@pytest.mark.skipif(not hasattr(os, "fork"), reason="fork worker backend")
-def test_mid_packet_worker_death_with_inherited_socket_is_bounded(tmp_path):
+@pytest.mark.skipif(not hasattr(os, "fork"), reason="descendant fault injection requires os.fork")
+def test_mid_packet_worker_death_with_inherited_socket_is_bounded(tmp_path, subprocess_env):
     pidfile = tmp_path / "descendant.pid"
     stopped = tmp_path / "descendant.stopped"
     source = textwrap.dedent(f"""
@@ -163,7 +171,7 @@ def test_mid_packet_worker_death_with_inherited_socket_is_bounded(tmp_path):
         import signal
         import struct
         import time
-        from bistra.executor import execute_parallel
+        from bistra.executor import _worker, execute_parallel
         pidfile = Path({str(pidfile)!r})
         stopped = Path({str(stopped)!r})
         class PartialPacket:
@@ -191,19 +199,30 @@ def test_mid_packet_worker_death_with_inherited_socket_is_bounded(tmp_path):
                 emit({{"text": "x" * 100000}})
             def finalize(self, emit):
                 pass
+        def start_worker(worker_id, initial):
+            context = multiprocessing.get_context("spawn")
+            parent, child = context.Pipe()
+            process = context.Process(target=_worker, args=(child, worker_id, PartialPacket(), initial))
+            try:
+                process.start()
+            finally:
+                child.close()
+            return process, parent
         if __name__ == "__main__":
-            result = execute_parallel(PartialPacket(), [0], workers=1, on_event=lambda event: None)
+            result = execute_parallel(
+                [0], workers=2, groups=[[0]], start_worker=start_worker,
+                parent_execute=lambda index, next_index: None, on_event=lambda event: None,
+            )
             print(json.dumps({{"crashes": result.crashes, "completed": sorted(result.completed),
                                "stopped": stopped.exists()}}))
     """)
-    env = dict(os.environ)
     script = tmp_path / "executor_probe.py"
     script.write_text(source)
     try:
         result = subprocess.run(
             [sys.executable, str(script)],
             cwd=tmp_path,
-            env=env,
+            env=subprocess_env,
             capture_output=True,
             text=True,
             timeout=8,

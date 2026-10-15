@@ -1,16 +1,9 @@
-import os
 import subprocess
 import sys
 import textwrap
 
 
-def environment():
-    env = dict(os.environ)
-    env["PYTEST_DISABLE_PLUGIN_AUTOLOAD"] = "1"
-    return env
-
-
-def test_uncaptured_worker_output_reaches_piped_stdout(tmp_path):
+def test_uncaptured_worker_output_reaches_piped_stdout(tmp_path, subprocess_env):
     for index in range(2):
         source = f"def test_output():\n    print('worker-output-{index}')\n"
         (tmp_path / f"test_output_{index}.py").write_text(source)
@@ -19,7 +12,7 @@ def test_uncaptured_worker_output_reaches_piped_stdout(tmp_path):
     result = subprocess.run(
         [sys.executable, "-m", "bistra", "-j", "2", *args],
         cwd=tmp_path,
-        env=environment(),
+        env=subprocess_env,
         capture_output=True,
         text=True,
         timeout=15,
@@ -29,9 +22,10 @@ def test_uncaptured_worker_output_reaches_piped_stdout(tmp_path):
     assert result.stdout.count("worker-output-1") == 1
 
 
-def test_flushing_workers_does_not_duplicate_parent_output(tmp_path):
+def test_flushing_workers_does_not_duplicate_parent_output(tmp_path, subprocess_env):
     source = textwrap.dedent("""
-        from bistra.executor import execute_parallel
+        import multiprocessing
+        from bistra.executor import _worker, execute_parallel
         class Output:
             def initialize(self, worker_id):
                 self.worker_id = worker_id
@@ -39,16 +33,28 @@ def test_flushing_workers_does_not_duplicate_parent_output(tmp_path):
                 print("case-output-" + str(index))
             def finalize(self, emit):
                 print("finalizer-output-" + str(self.worker_id))
+        def start_worker(worker_id, initial):
+            context = multiprocessing.get_context("spawn")
+            parent, child = context.Pipe()
+            process = context.Process(target=_worker, args=(child, worker_id, Output(), initial))
+            try:
+                process.start()
+            finally:
+                child.close()
+            return process, parent
         if __name__ == "__main__":
             print("parent-output", end="")
-            result = execute_parallel(Output(), [0, 1], workers=2, on_event=lambda event: None)
+            result = execute_parallel(
+                [0, 1], workers=3, groups=[[0], [1]], start_worker=start_worker,
+                parent_execute=lambda index, next_index: None, on_event=lambda event: None,
+            )
             assert not result.crashes
     """)
     script = tmp_path / "executor_probe.py"
     script.write_text(source)
     result = subprocess.run(
         [sys.executable, str(script)],
-        env=environment(),
+        env=subprocess_env,
         capture_output=True,
         text=True,
         timeout=15,
@@ -64,9 +70,10 @@ def test_flushing_workers_does_not_duplicate_parent_output(tmp_path):
         assert result.stdout.count(value) == 1
 
 
-def test_stream_retained_during_collection_stays_open_for_test_logging(tmp_path):
+def test_stream_retained_during_collection_stays_open_for_test_logging(tmp_path, subprocess_env):
     (tmp_path / "pytest.ini").write_text("[pytest]\n")
-    (tmp_path / "test_logging.py").write_text(textwrap.dedent('''
+    (tmp_path / "test_logging.py").write_text(
+        textwrap.dedent("""
         import sys
         import pytest
 
@@ -76,11 +83,16 @@ def test_stream_retained_during_collection_stays_open_for_test_logging(tmp_path)
         def test_logging(index):
             print("retained stream evidence", file=LOG_STREAM)
             assert False, "intentional failure after logging"
-    '''))
+    """)
+    )
     result = subprocess.run(
         [sys.executable, "-m", "bistra", "-j", "2", "--", "-q"],
-        cwd=tmp_path, env=environment(), capture_output=True, text=True,
-        timeout=15, check=False,
+        cwd=tmp_path,
+        env=subprocess_env,
+        capture_output=True,
+        text=True,
+        timeout=15,
+        check=False,
     )
     assert result.returncode == 1, result.stdout + result.stderr
     assert "4 failed" in result.stdout
@@ -88,7 +100,7 @@ def test_stream_retained_during_collection_stays_open_for_test_logging(tmp_path)
     assert result.stdout.count("Captured stderr call") == 4
 
 
-def test_retained_multiprocessing_resources_are_released_at_worker_exit(tmp_path):
+def test_retained_multiprocessing_resources_are_released_at_worker_exit(tmp_path, subprocess_env):
     (tmp_path / "pytest.ini").write_text("[pytest]\n")
     (tmp_path / "test_lock.py").write_text(
         textwrap.dedent("""
@@ -106,7 +118,7 @@ def test_retained_multiprocessing_resources_are_released_at_worker_exit(tmp_path
     result = subprocess.run(
         [sys.executable, "-m", "bistra", "-j", "2", "--", "-q"],
         cwd=tmp_path,
-        env=environment(),
+        env=subprocess_env,
         capture_output=True,
         text=True,
         timeout=15,

@@ -1,25 +1,32 @@
-from __future__ import annotations
-
 import hashlib
 import importlib
 import os
 import signal
 import sys
 import warnings
+from collections.abc import Callable, Sequence
 from pathlib import Path
+from typing import TYPE_CHECKING, Any, Literal, NoReturn, cast
 
 import pytest
 
 from .durations import load_history, save_history, update_history
 from .executor import WorkerStop, execute_parallel
+from .protocol import ControlEvent, Emit, Event
 from .scheduling import prioritize_groups
 
+if TYPE_CHECKING:
+    from _pytest.capture import CaptureManager
+    from _pytest.terminal import TerminalReporter
+
+    from .fresh import WorkerPool
+
 _UNSUPPORTED = object()
-_warning_fallbacks = {}
+_warning_fallbacks: dict[tuple[str, str, tuple[tuple[str, str], ...]], type[Warning]] = {}
 
 
 def _warning_value(value, seen=None):
-    """Restrict warning payloads to transportable, import-independent values."""
+    """Limit warning payloads to values that can cross processes without imports."""
     if type(value) in (type(None), bool, int, float, complex, str, bytes):
         return value
     if type(value) not in (tuple, list, dict):
@@ -30,10 +37,7 @@ def _warning_value(value, seen=None):
     seen.add(id(value))
     try:
         if type(value) is dict:
-            converted = [
-                (_warning_value(k, seen), _warning_value(v, seen))
-                for k, v in value.items()
-            ]
+            converted = [(_warning_value(k, seen), _warning_value(v, seen)) for k, v in value.items()]
             if any(k is _UNSUPPORTED or v is _UNSUPPORTED for k, v in converted):
                 return _UNSUPPORTED
             return dict(converted)
@@ -52,31 +56,21 @@ def _warning_class(cls):
         "module": cls.__module__,
         "qualname": cls.__qualname__,
         "name": cls.__name__,
-        "bases": [
-            (base.__module__, base.__qualname__)
-            for base in cls.__mro__[1:]
-            if issubclass(base, Warning)
-        ],
+        "bases": [(base.__module__, base.__qualname__) for base in cls.__mro__[1:] if issubclass(base, Warning)],
     }
 
 
-def _serialize_warning(warning):
+def _serialize_warning(warning: warnings.WarningMessage) -> dict[str, Any]:
     message = warning.message
-    args = (
-        _warning_value(message.args) if isinstance(message, Warning) else _UNSUPPORTED
-    )
+    args = _warning_value(message.args) if isinstance(message, Warning) else _UNSUPPORTED
     data = {
         "message_str": str(message),
-        "message_class": _warning_class(type(message))
-        if isinstance(message, Warning)
-        else None,
+        "message_class": _warning_class(type(message)) if isinstance(message, Warning) else None,
         "message_args": None if args is _UNSUPPORTED else args,
-        "message_args_repr": repr(message.args)
-        if isinstance(message, Warning)
-        else None,
+        "message_args_repr": repr(message.args) if isinstance(message, Warning) else None,
         "category_class": _warning_class(warning.category),
     }
-    for name in warning._WARNING_DETAILS:
+    for name in warning._WARNING_DETAILS:  # ty: ignore[unresolved-attribute]
         if name not in ("message", "category"):
             value = getattr(warning, name)
             converted = _warning_value(value)
@@ -112,9 +106,9 @@ def _reconstruct_warning_class(reference):
             ),
             Warning,
         )
-        # Do not mutate imported modules. Local classes have no parent-process
-        # identity to recover; preserve their display name and warning family.
-        # Warning's construction and formatting avoid inherited custom code.
+        # Local warning classes cannot be imported in the parent. Preserve their
+        # name and warning family without changing any imported module.
+        # Use Warning's constructor and formatting to avoid custom code.
         try:
             cls = type(
                 reference["name"],
@@ -140,7 +134,7 @@ def _reconstruct_warning_class(reference):
     return _warning_fallbacks[key], True
 
 
-def _deserialize_warning(data):
+def _deserialize_warning(data: dict[str, Any]) -> warnings.WarningMessage:
     category, category_fallback = _reconstruct_warning_class(data["category_class"])
     cls, message_fallback = _reconstruct_warning_class(data["message_class"])
     message = data["message_str"]
@@ -155,22 +149,21 @@ def _deserialize_warning(data):
         else:
             message_fallback = True
         if message_fallback:
-            # Keep the original text exactly, even if custom formatting cannot
-            # be reconstructed from the constructor arguments.
+            # Preserve the original text when constructor arguments cannot reproduce it.
             if category_fallback:
                 message = category(data["message_str"])
             else:
                 message = Warning(data["message_str"])
     kwargs = {
         name: data[name]
-        for name in warnings.WarningMessage._WARNING_DETAILS
+        for name in warnings.WarningMessage._WARNING_DETAILS  # ty: ignore[unresolved-attribute]
         if name not in ("message", "category")
     }
     warning = warnings.WarningMessage(message, category, **kwargs)
-    # Observer code can inspect the qualified class names, original text and
-    # argument repr even when a local/unconstructable class requires fallback.
-    warning._bistra_warning_metadata = data
-    warning._bistra_warning_fallback = category_fallback or message_fallback
+    # Keep qualified class names, text and argument repr for warning hooks to
+    # inspect, even when the original warning cannot be reconstructed.
+    warning._bistra_warning_metadata = data  # ty: ignore[unresolved-attribute]
+    warning._bistra_warning_fallback = category_fallback or message_fallback  # ty: ignore[unresolved-attribute]
     return warning
 
 
@@ -185,26 +178,30 @@ class _WorkerTerminalProxy:
 
 
 class _WorkerReporter:
-    def __init__(self, config):
+    def __init__(self, config: pytest.Config) -> None:
         self.config = config
-        self.emit = None
+        self.emit: Emit | None = None
 
-    def pytest_runtest_logstart(self, nodeid, location):
+    def pytest_runtest_logstart(self, nodeid: str, location: tuple[str, int | None, str]) -> None:
         if self.emit:
             self.emit({"type": "logstart", "nodeid": nodeid, "location": location})
 
-    def pytest_runtest_logfinish(self, nodeid, location):
+    def pytest_runtest_logfinish(self, nodeid: str, location: tuple[str, int | None, str]) -> None:
         if self.emit:
             self.emit({"type": "logfinish", "nodeid": nodeid, "location": location})
 
-    def pytest_runtest_logreport(self, report):
+    def pytest_runtest_logreport(self, report: pytest.TestReport) -> None:
         if self.emit:
-            data = self.config.hook.pytest_report_to_serializable(
-                config=self.config, report=report
-            )
+            data = self.config.hook.pytest_report_to_serializable(config=self.config, report=report)
             self.emit({"type": "report", "data": data})
 
-    def pytest_warning_recorded(self, warning_message, when, nodeid, location):
+    def pytest_warning_recorded(
+        self,
+        warning_message: warnings.WarningMessage,
+        when: Literal["config", "collect", "runtest"],
+        nodeid: str,
+        location: tuple[str, int, str] | None,
+    ) -> None:
         if self.emit:
             self.emit(
                 {
@@ -217,29 +214,24 @@ class _WorkerReporter:
             )
 
 
+def _initialize_temp_directory(config: pytest.Config, base: Path, worker_id: int) -> None:
+    config.option.basetemp = str(base / f"worker-{worker_id}")
+    factory = pytest.TempPathFactory.from_config(config, _ispytest=True)
+    # Pytest adds these fixture attributes to Config at runtime.
+    config._tmp_path_factory = factory  # ty: ignore[unresolved-attribute]
+    if hasattr(config, "_tmpdirhandler"):
+        config._tmpdirhandler = pytest.TempdirFactory(factory, _ispytest=True)
+
+
 class PytestAdapter:
-    def __init__(self, session, owner, base):
+    def __init__(self, session: pytest.Session, owner: "BistraPlugin", base: Path) -> None:
         self.session = session
         self.config = session.config
         self.owner = owner
         self.base = base
-        self.reporter = None
+        self.reporter = _WorkerReporter(self.config)
 
-    def initialize_temp_directory(self, worker_id):
-        from _pytest.tmpdir import TempPathFactory
-
-        self.config.option.basetemp = str(self.base / f"worker-{worker_id}")
-        self.config._tmp_path_factory = TempPathFactory.from_config(
-            self.config, _ispytest=True
-        )
-        if hasattr(self.config, "_tmpdirhandler"):
-            from _pytest.legacypath import TempdirFactory
-
-            self.config._tmpdirhandler = TempdirFactory(
-                self.config._tmp_path_factory, _ispytest=True
-            )
-
-    def initialize(self, worker_id):
+    def initialize(self, worker_id: int) -> None:
         config = self.config
         pm = config.pluginmanager
         pm.unregister(self.owner)
@@ -247,29 +239,16 @@ class PytestAdapter:
         if terminal is not None:
             pm.unregister(terminal)
             pm.register(_WorkerTerminalProxy(terminal), "terminalreporter")
-        from _pytest.junitxml import xml_key
-
-        if xml_key in config.stash:
-            xml = config.stash[xml_key]
-            pm.unregister(xml)
-            del config.stash[xml_key]
-        self.initialize_temp_directory(worker_id)
-        capman = pm.get_plugin("capturemanager")
-        if capman:
-            # Fresh interpreters own their capture streams; keep retained log sinks alive.
-            capman.suspend_global_capture()
-        self.reporter = _WorkerReporter(config)
+        _initialize_temp_directory(config, self.base, worker_id)
         pm.register(self.reporter, "bistra-worker-reporter")
 
-    def execute(self, index, next_index, emit):
-        from _pytest.outcomes import Exit
-
+    def execute(self, index: int, next_index: int | None, emit: Emit) -> None:
         self.reporter.emit = emit
         item = self.session.items[index]
         nextitem = self.session.items[next_index] if next_index is not None else None
         try:
             self.config.hook.pytest_runtest_protocol(item=item, nextitem=nextitem)
-        except Exit as error:
+        except pytest.exit.Exception as error:
             emit(
                 {
                     "type": "control",
@@ -289,29 +268,25 @@ class PytestAdapter:
             )
             raise WorkerStop("worker interrupted") from None
         if self.session.shouldfail or self.session.shouldstop:
-            kind = "fail" if self.session.shouldfail else "stop"
+            kind: Literal["fail", "stop"] = "fail" if self.session.shouldfail else "stop"
             reason = str(self.session.shouldfail or self.session.shouldstop)
             emit({"type": "control", "kind": kind, "message": reason})
             raise WorkerStop(reason, completed=True)
 
-    def finalize(self, emit):
+    def finalize(self, emit: Emit) -> None:
         self.reporter.emit = emit
-        status = (
-            pytest.ExitCode.TESTS_FAILED
-            if self.session.testsfailed
-            else pytest.ExitCode.OK
-        )
+        status = pytest.ExitCode.TESTS_FAILED if self.session.testsfailed else pytest.ExitCode.OK
         self.config.hook.pytest_sessionfinish(session=self.session, exitstatus=status)
         self.config._ensure_unconfigure()
 
 
-def _fixture_groups(items):
-    """Keep shared scoped fixture contexts together in their collected order.
+def _fixture_groups(items: Sequence[pytest.Item]) -> list[list[int]]:
+    """Keep tests that share scoped fixtures together, in collection order.
 
-    Session fixtures normally remain per worker. Parameterized session fixtures
-    also group their consumers by parameter so priority sorting cannot alternate
-    their values repeatedly. Dynamically requested fixtures still follow pytest's
-    normal setup and teardown rules but cannot inform grouping before execution.
+    Session fixtures stay local to each worker. Group parameterized session
+    fixtures by parameter so scheduling does not repeatedly switch values.
+    Dynamically requested fixtures use pytest's normal lifecycle but are not
+    known during collection, so they cannot affect these groups.
     """
     from _pytest.fixtures import get_scope_node, get_scope_package
     from _pytest.scope import Scope
@@ -328,7 +303,7 @@ def _fixture_groups(items):
         roots[root(right)] = root(left)
 
     scoped_owners = set()
-    parameters = {}
+    parameters: dict[tuple[object, int], int] = {}
     for index, item in enumerate(items):
         info = getattr(item, "_fixtureinfo", None)
         if info is None:
@@ -338,18 +313,10 @@ def _fixture_groups(items):
                 continue
             definition = definitions[-1]
             callspec = getattr(item, "callspec", None)
-            scope = (
-                callspec._arg2scope[name]
-                if callspec is not None and name in callspec.params
-                else definition._scope
-            )
+            scope = callspec._arg2scope[name] if callspec is not None and name in callspec.params else definition._scope
             if scope is Scope.Function:
                 continue
-            owner = (
-                get_scope_package(item, definition)
-                if scope is Scope.Package
-                else get_scope_node(item, scope)
-            )
+            owner = get_scope_package(item, definition) if scope is Scope.Package else get_scope_node(item, scope)
             if isinstance(owner, pytest.Session):
                 if callspec is not None and name in callspec.indices:
                     key = (definition, callspec.indices[name])
@@ -360,7 +327,7 @@ def _fixture_groups(items):
                 continue
             if owner is not None:
                 scoped_owners.add(owner)
-    first = {}
+    first: dict[object, int] = {}
     for index, item in enumerate(items):
         for node in item.listchain():
             if node in scoped_owners:
@@ -368,17 +335,17 @@ def _fixture_groups(items):
                     join(first[node], index)
                 else:
                     first[node] = index
-    groups = {}
+    groups: dict[int, list[int]] = {}
     for index in range(len(items)):
         groups.setdefault(root(index), []).append(index)
     return list(groups.values())
 
 
 class BistraPlugin:
-    def __init__(self, *, workers, pool=None):
+    def __init__(self, *, workers: int, pool: "WorkerPool | None" = None) -> None:
         self.workers = workers
         self.pool = pool
-        self.phase_durations = {}
+        self.phase_durations: dict[str, dict[str, float]] = {}
 
     @pytest.hookimpl(tryfirst=True)
     def pytest_configure(self, config):
@@ -391,14 +358,12 @@ class BistraPlugin:
                 "bistra cannot be combined with xdist worker/distribution options; "
                 "use bistra -j or run pytest-xdist separately"
             )
-        if self.workers > 1 and (
-            config.option.usepdb or getattr(config.option, "trace", False)
-        ):
+        if self.workers > 1 and (config.option.usepdb or getattr(config.option, "trace", False)):
             raise pytest.UsageError("bistra interactive debugging requires -j 1")
         if self.pool is not None and config.option.xmlpath:
             from _pytest.junitxml import LogXML, xml_key
 
-            # Pytest skips its XML writer on workers; the original slot owns aggregation.
+            # Pytest skips XML on workers; the parent writes the combined report.
             config.stash[xml_key] = LogXML(
                 config.option.xmlpath,
                 config.option.junitprefix,
@@ -413,13 +378,13 @@ class BistraPlugin:
     def pytest_report_header(self):
         return f"bistra: fresh interpreters, {self.workers} execution slots"
 
-    def pytest_runtest_logreport(self, report):
+    def pytest_runtest_logreport(self, report: pytest.TestReport) -> None:
         if report.when in ("setup", "call", "teardown"):
             phases = self.phase_durations.setdefault(report.nodeid, {})
             phases[report.when] = phases.get(report.when, 0.0) + report.duration
 
     @pytest.hookimpl(tryfirst=True)
-    def pytest_runtestloop(self, session):
+    def pytest_runtestloop(self, session: pytest.Session) -> bool | None:
         config = session.config
         from .fresh import child_context, run_child
 
@@ -439,87 +404,62 @@ class BistraPlugin:
             return None
         if self.workers == 1:
             return None
-        terminal = config.pluginmanager.get_plugin("terminalreporter")
-        capman = config.pluginmanager.get_plugin("capturemanager")
+        terminal = cast("TerminalReporter | None", config.pluginmanager.get_plugin("terminalreporter"))
+        capman = cast("CaptureManager | None", config.pluginmanager.get_plugin("capturemanager"))
         if capman:
             capman.suspend_global_capture()
-        base = config._tmp_path_factory.getbasetemp() / "bistra-workers"
+        base = config._tmp_path_factory.getbasetemp() / "bistra-workers"  # ty: ignore[unresolved-attribute]
         base.mkdir(exist_ok=True)
-        key = hashlib.sha256((str(config.rootpath) + sys.version).encode()).hexdigest()[
-            :24
-        ]
-        cache_path = (
-            Path(os.environ.get("XDG_CACHE_HOME", str(Path.home() / ".cache")))
-            / "bistra"
-            / f"{key}.json"
-        )
+        key = hashlib.sha256((str(config.rootpath) + sys.version).encode()).hexdigest()[:24]
+        cache_path = Path(os.environ.get("XDG_CACHE_HOME", str(Path.home() / ".cache"))) / "bistra" / f"{key}.json"
         history = load_history(cache_path)
         indices = list(range(len(session.items)))
         estimates = {
-            index: history[item.nodeid]["total"]
-            for index, item in enumerate(session.items)
-            if item.nodeid in history
+            index: history[item.nodeid]["total"] for index, item in enumerate(session.items) if item.nodeid in history
         }
         fixture_groups = _fixture_groups(session.items)
         try:
-            groups = (
-                prioritize_groups(fixture_groups, estimates)
-                if estimates
-                else fixture_groups
-            )
+            groups = prioritize_groups(fixture_groups, estimates) if estimates else fixture_groups
         except ValueError:
-            # Unusable optional estimates must never prevent test execution.
+            # Ignore unusable duration estimates so tests can still run.
             history = {}
             estimates = {}
             groups = fixture_groups
-        measured = {}
-        worker_exit = None
-        adapter = PytestAdapter(session, self, base)
+        measured: dict[str, dict[str, float]] = {}
+        worker_exit: ControlEvent | None = None
         parent_initialized = False
 
-        def execute_parent(index, next_index):
+        def execute_parent(index: int, next_index: int | None) -> None:
             nonlocal parent_initialized
             if not parent_initialized:
-                # Collection agreement is checked before fixture initialization.
-                # The parent keeps its normal terminal, capture and session hooks.
-                adapter.initialize_temp_directory(self.workers - 1)
+                # Only set up fixtures after all collections agree.
+                # Keep the parent's normal terminal, capture and session hooks.
+                _initialize_temp_directory(config, base, self.workers - 1)
                 parent_initialized = True
             item = session.items[index]
             nextitem = session.items[next_index] if next_index is not None else None
             config.hook.pytest_runtest_protocol(item=item, nextitem=nextitem)
             if session.shouldfail or session.shouldstop:
-                raise WorkerStop(
-                    str(session.shouldfail or session.shouldstop), completed=True
-                )
+                raise WorkerStop(str(session.shouldfail or session.shouldstop), completed=True)
 
-        def completed(index, elapsed):
+        def completed(index: int, elapsed: float) -> None:
             nodeid = session.items[index].nodeid
             phases = self.phase_durations.pop(nodeid, {})
             measured[nodeid] = {
                 "total": elapsed,
-                **{
-                    phase: phases.get(phase, 0.0)
-                    for phase in ("setup", "call", "teardown")
-                },
+                **{phase: phases.get(phase, 0.0) for phase in ("setup", "call", "teardown")},
             }
 
-        def event(message):
+        def event(message: Event) -> bool | None:
             nonlocal worker_exit
-            kind = message["type"]
-            if kind == "report":
-                report = config.hook.pytest_report_from_serializable(
-                    config=config, data=message["data"]
-                )
+            if message["type"] == "report":
+                report = config.hook.pytest_report_from_serializable(config=config, data=message["data"])
                 config.hook.pytest_runtest_logreport(report=report)
-            elif kind == "logstart":
-                config.hook.pytest_runtest_logstart(
-                    nodeid=message["nodeid"], location=message["location"]
-                )
-            elif kind == "logfinish":
-                config.hook.pytest_runtest_logfinish(
-                    nodeid=message["nodeid"], location=message["location"]
-                )
-            elif kind == "warning":
+            elif message["type"] == "logstart":
+                config.hook.pytest_runtest_logstart(nodeid=message["nodeid"], location=message["location"])
+            elif message["type"] == "logfinish":
+                config.hook.pytest_runtest_logfinish(nodeid=message["nodeid"], location=message["location"])
+            elif message["type"] == "warning":
                 warning = _deserialize_warning(message["data"])
                 config.hook.pytest_warning_recorded.call_historic(
                     kwargs={
@@ -529,7 +469,7 @@ class BistraPlugin:
                         "location": message["location"],
                     }
                 )
-            elif kind == "control":
+            elif message["type"] == "control":
                 control = message["kind"]
                 if control == "fail":
                     session.shouldfail = message["message"]
@@ -540,7 +480,9 @@ class BistraPlugin:
                 return False
             if session.shouldfail or session.shouldstop:
                 return False
+            return None
 
+        assert self.pool is not None, "Parallel execution requires collected workers."
         self.pool.prepare(session, base)
         if terminal:
             terminal.write_line(
@@ -548,13 +490,10 @@ class BistraPlugin:
                 "execution slots (fresh workers + original process)"
             )
             if estimates:
-                terminal.write_line(
-                    f"bistra: using duration history for {len(estimates)}/{len(indices)} tests"
-                )
+                terminal.write_line(f"bistra: using duration history for {len(estimates)}/{len(indices)} tests")
             else:
                 terminal.write_line("bistra: learning test durations")
         result = execute_parallel(
-            adapter,
             indices,
             workers=self.workers,
             on_event=event,
@@ -568,29 +507,18 @@ class BistraPlugin:
             save_history(cache_path, update_history(history, measured))
         except OSError:
             if terminal:
-                terminal.write_line(
-                    "bistra: could not save optional duration cache", yellow=True
-                )
+                terminal.write_line("bistra: could not save optional duration cache", yellow=True)
         if result.crashes:
             for crash in result.crashes:
                 if terminal:
                     index = crash.get("index")
-                    nodeid = (
-                        session.items[index].nodeid
-                        if index is not None
-                        else "during worker startup or cleanup"
-                    )
+                    nodeid = session.items[index].nodeid if index is not None else "during worker startup or cleanup"
                     exitcode = crash.get("exitcode")
                     cause = ""
                     if exitcode is not None:
-                        cause = (
-                            f" ({signal.Signals(-exitcode).name})"
-                            if exitcode < 0
-                            else f" (exit {exitcode})"
-                        )
+                        cause = f" ({signal.Signals(-exitcode).name})" if exitcode < 0 else f" (exit {exitcode})"
                     terminal.write_line(
-                        f"bistra worker failure: {nodeid}{cause}: "
-                        + crash["traceback"],
+                        f"bistra worker failure: {nodeid}{cause}: " + crash["traceback"],
                         red=True,
                     )
             raise session.Interrupted(
@@ -598,9 +526,10 @@ class BistraPlugin:
             )
         if worker_exit is not None:
             if worker_exit["kind"] == "exit":
-                pytest.exit(
-                    worker_exit["message"], returncode=worker_exit["returncode"]
-                )
+                # pytest 8's callable protocol loses its first argument in ty.
+                # https://github.com/astral-sh/ty/issues/3981
+                exit_pytest = cast(Callable[[str, int | None], NoReturn], pytest.exit)
+                exit_pytest(worker_exit["message"], worker_exit["returncode"])
             raise KeyboardInterrupt
         if session.shouldfail:
             raise session.Failed(session.shouldfail)

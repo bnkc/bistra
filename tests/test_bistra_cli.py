@@ -2,7 +2,9 @@ import json
 import os
 import subprocess
 import sys
+import sysconfig
 from importlib.metadata import version
+from pathlib import Path
 
 import pytest
 
@@ -57,6 +59,24 @@ def test_cli_version(capsys):
         main(["--version"])
     assert error.value.code == 0
     assert capsys.readouterr().out == f"bistra {installed_version}\n"
+
+
+def test_installed_console_script_reports_version(tmp_path, subprocess_env):
+    script = Path(sysconfig.get_path("scripts")) / ("bistra.exe" if os.name == "nt" else "bistra")
+    env = subprocess_env.copy()
+    env.pop("PYTHONPATH", None)
+
+    result = subprocess.run(
+        [script, "--version"],
+        cwd=tmp_path,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=15,
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert result.stdout == f"bistra {version('bistra')}\n"
 
 
 def test_installed_plugin_adds_help_options(pytester, monkeypatch):

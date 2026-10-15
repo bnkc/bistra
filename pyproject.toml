@@ -48,12 +48,12 @@ dev = [
     "tox>=4.65,<5",
 ]
 test = ["pytest-xdist==3.8.0"]
-lint = ["ruff>=0.17,<0.18"]
-type = ["ty>=0.0.88,<0.1"]
+lint = ["ruff==0.17.1"]
+type = ["ty==0.0.88"]
 package = ["build>=1.6,<2", "twine>=7,<8"]
 
 [tool.uv.build-backend]
-source-include = ["tests/**", "CONTRIBUTING.md"]
+source-include = ["tests/**", "CONTRIBUTING.md", "CHANGELOG.md"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

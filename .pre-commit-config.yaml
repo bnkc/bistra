@@ -3,13 +3,21 @@ repos:
     rev: v0.17.1
     hooks:
       - id: ruff-check
+        name: Lint
         args: [--fix]
       - id: ruff-format
+        name: Format
   - repo: local
     hooks:
-      - id: checks
-        name: Types and tests
-        entry: uv run --locked tox -e type,py
+      - id: types
+        name: Types
+        entry: uv run --locked tox -e type
+        language: unsupported
+        pass_filenames: false
+        always_run: true
+      - id: tests
+        name: Tests
+        entry: uv run --locked tox -e py
         language: unsupported
         pass_filenames: false
         always_run: true

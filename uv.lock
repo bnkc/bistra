@@ -57,18 +57,18 @@ dev = [
     { name = "pre-commit", specifier = ">=4.7,<5" },
     { name = "pytest", specifier = "==8.4.2" },
     { name = "pytest-xdist", specifier = "==3.8.0" },
-    { name = "ruff", specifier = ">=0.17,<0.18" },
+    { name = "ruff", specifier = "==0.17.1" },
     { name = "tox", specifier = ">=4.65,<5" },
     { name = "twine", specifier = ">=7,<8" },
-    { name = "ty", specifier = ">=0.0.88,<0.1" },
+    { name = "ty", specifier = "==0.0.88" },
 ]
-lint = [{ name = "ruff", specifier = ">=0.17,<0.18" }]
+lint = [{ name = "ruff", specifier = "==0.17.1" }]
 package = [
     { name = "build", specifier = ">=1.6,<2" },
     { name = "twine", specifier = ">=7,<8" },
 ]
 test = [{ name = "pytest-xdist", specifier = "==3.8.0" }]
-type = [{ name = "ty", specifier = ">=0.0.88,<0.1" }]
+type = [{ name = "ty", specifier = "==0.0.88" }]
 
 [[package]]
 name = "build"

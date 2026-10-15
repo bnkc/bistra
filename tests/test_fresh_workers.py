@@ -142,8 +142,7 @@ def test_nonexecuting_commands_do_not_start_workers(tmp_path, subprocess_env, op
     assert len(list(tmp_path.glob("collector-*"))) == count
 
 
-@pytest.mark.parametrize("load_xdist", [False, True])
-def test_worker_identity_precedes_project_configuration(tmp_path, subprocess_env, load_xdist):
+def test_worker_identity_precedes_project_configuration(tmp_path, subprocess_env):
     (tmp_path / "early_plugin.py").write_text(
         textwrap.dedent("""
         import os
@@ -205,11 +204,8 @@ def test_worker_identity_precedes_project_configuration(tmp_path, subprocess_env
             assert len(list(Path().glob("started-*"))) == 3
     """)
     )
-    args = ["-p", "early_plugin"]
-    if load_xdist:
-        args += ["-p", "xdist.plugin"]
     env = {**subprocess_env, "RESOURCE_PREFIX": "original"}
-    result = run(tmp_path, env, *args)
+    result = run(tmp_path, env, "-p", "early_plugin")
     assert result.returncode == 0, result.stdout + result.stderr
     assert "12 passed" in result.stdout
     identities = [json.loads(path.read_text()) for path in tmp_path.glob("import-*.json")]

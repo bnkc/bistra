@@ -248,59 +248,27 @@ class OverlapRecorder(Recorder):
         super().execute(index, next_index, emit)
 
 
-class ReservationRecorder(Recorder):
-    def __init__(self, directory):
-        self.directory = directory
-
-    def execute(self, index, next_index, emit):
-        if index == 2:
-            (self.directory / "medium-started").touch()
-        super().execute(index, next_index, emit)
-
-
-def _start_after_parent(connection, worker_id, adapter, initial):
-    from bistra.executor import _worker
-
-    _wait_for_file(adapter.directory / "parent-started")
-    _worker(connection, worker_id, adapter, initial)
-
-
-def test_long_parent_reserves_tiny_followup_and_leaves_whole_group_for_child(
-    tmp_path,
-):
-    adapter = ReservationRecorder(tmp_path)
+def test_balanced_queues_preserve_affinity_and_lookahead_for_parent_and_child():
     events = []
     parent_calls = []
     completions = []
     groups = [[0], [1], [2, 3], [4]]
-
-    def parent_execute(index, next_index):
-        parent_calls.append((index, next_index))
-        if index == 1:
-            (tmp_path / "parent-started").touch()
-            _wait_for_file(tmp_path / "medium-started")
-
     result = execute_parallel(
         list(range(5)),
         workers=2,
         groups=groups,
         estimates={0: 1, 1: 100, 2: 3, 3: 3, 4: 0.001},
-        start_worker=worker_starter(adapter, target=_start_after_parent),
-        parent_execute=parent_execute,
+        start_worker=worker_starter(Recorder()),
+        parent_execute=lambda index, next_index: parent_calls.append((index, next_index)),
         on_event=events.append,
         on_complete=lambda index, elapsed: completions.append(index),
     )
     assert result.completed == set(range(5))
     assert not result.crashes
     assert sorted(completions) == list(range(5))
-    assert parent_calls == [(1, 4), (4, None)]
+    assert parent_calls == [(0, 2), (2, 3), (3, 4), (4, None)]
     values = [event for event in events if event["type"] == "value"]
-    assert [(event["value"], event["next"]) for event in values] == [
-        (0, 2),
-        (2, 3),
-        (3, None),
-    ]
-    assert len({event["pid"] for event in values}) == 1
+    assert [(event["value"], event["next"]) for event in values] == [(1, None)]
     assert values[0]["pid"] != os.getpid()
     assert groups == [[0], [1], [2, 3], [4]]
 

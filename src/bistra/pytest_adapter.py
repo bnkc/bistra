@@ -1,5 +1,4 @@
 import hashlib
-import importlib
 import os
 import signal
 import sys
@@ -13,13 +12,13 @@ import pytest
 from .durations import load_history, save_history, update_history
 from .executor import WorkerStop, execute_parallel
 from .protocol import ControlEvent, Emit, Event
-from .scheduling import prioritize_groups
+from .scheduling import estimate_durations
 
 if TYPE_CHECKING:
     from _pytest.capture import CaptureManager
     from _pytest.terminal import TerminalReporter
 
-    from .fresh import WorkerPool
+    from .fresh import Collection, WorkerPool
 
 _UNSUPPORTED = object()
 _warning_fallbacks: dict[tuple[str, str, tuple[tuple[str, str], ...]], type[Warning]] = {}
@@ -63,11 +62,13 @@ def _warning_class(cls):
 def _serialize_warning(warning: warnings.WarningMessage) -> dict[str, Any]:
     message = warning.message
     args = _warning_value(message.args) if isinstance(message, Warning) else _UNSUPPORTED
+    attributes = _warning_value(vars(message)) if isinstance(message, Warning) else _UNSUPPORTED
     data = {
         "message_str": str(message),
         "message_class": _warning_class(type(message)) if isinstance(message, Warning) else None,
         "message_args": None if args is _UNSUPPORTED else args,
         "message_args_repr": repr(message.args) if isinstance(message, Warning) else None,
+        "message_attributes": {} if attributes is _UNSUPPORTED else attributes,
         "category_class": _warning_class(warning.category),
     }
     for name in warning._WARNING_DETAILS:  # ty: ignore[unresolved-attribute]
@@ -82,7 +83,9 @@ def _resolve_warning_class(module, qualname):
     if "<locals>" in qualname:
         return None
     try:
-        value = importlib.import_module(module)
+        # Reporting must not import a worker's test modules into the controller.
+        # Unknown classes use the same fallback as local warning classes.
+        value = sys.modules.get(module)
         for component in qualname.split("."):
             value = getattr(value, component)
         return value if isinstance(value, type) and issubclass(value, Warning) else None
@@ -118,7 +121,7 @@ def _reconstruct_warning_class(reference):
                     "__qualname__": reference["qualname"],
                     "__new__": staticmethod(Warning.__new__),
                     "__init__": Warning.__init__,
-                    "__str__": Warning.__str__,
+                    "__str__": lambda self: getattr(self, "_bistra_warning_text", Warning.__str__(self)),
                 },
             )
         except TypeError:
@@ -128,6 +131,7 @@ def _reconstruct_warning_class(reference):
                 {
                     "__module__": reference["module"],
                     "__qualname__": reference["qualname"],
+                    "__str__": lambda self: getattr(self, "_bistra_warning_text", Warning.__str__(self)),
                 },
             )
         _warning_fallbacks[key] = cls
@@ -152,6 +156,10 @@ def _deserialize_warning(data: dict[str, Any]) -> warnings.WarningMessage:
             # Preserve the original text when constructor arguments cannot reproduce it.
             if category_fallback:
                 message = category(data["message_str"])
+                if data["message_args"] is not None:
+                    message.args = data["message_args"]
+                message.__dict__.update(data["message_attributes"])
+                message._bistra_warning_text = data["message_str"]
             else:
                 message = Warning(data["message_str"])
     kwargs = {
@@ -210,6 +218,38 @@ class _WorkerReporter:
                     "when": when,
                     "nodeid": nodeid,
                     "location": location,
+                }
+            )
+
+
+class _CollectionReporter(_WorkerReporter):
+    def __init__(self, config: pytest.Config) -> None:
+        super().__init__(config)
+        self.events: list[Event] = []
+        self.emit = self.events.append
+        self.deselected = 0
+
+    def pytest_collectreport(self, report: pytest.CollectReport) -> None:
+        if not report.passed:
+            data = self.config.hook.pytest_report_to_serializable(config=self.config, report=report)
+            self.events.append({"type": "collectreport", "data": data})
+
+    def pytest_deselected(self, items: Sequence[pytest.Item]) -> None:
+        self.deselected += len(items)
+
+
+def _replay_collection(config: pytest.Config, events: list[Event]) -> None:
+    for event in events:
+        if event["type"] == "collectreport":
+            report = config.hook.pytest_report_from_serializable(config=config, data=event["data"])
+            config.hook.pytest_collectreport(report=report)
+        elif event["type"] == "warning":
+            config.hook.pytest_warning_recorded.call_historic(
+                kwargs={
+                    "warning_message": _deserialize_warning(event["data"]),
+                    "when": event["when"],
+                    "nodeid": event["nodeid"],
+                    "location": event["location"],
                 }
             )
 
@@ -277,7 +317,9 @@ class PytestAdapter:
         self.reporter.emit = emit
         status = pytest.ExitCode.TESTS_FAILED if self.session.testsfailed else pytest.ExitCode.OK
         self.config.hook.pytest_sessionfinish(session=self.session, exitstatus=status)
+        output = self.config.workeroutput  # ty: ignore[unresolved-attribute]
         self.config._ensure_unconfigure()
+        emit({"type": "workeroutput", "data": output})
 
 
 def _fixture_groups(items: Sequence[pytest.Item]) -> list[list[int]]:
@@ -345,6 +387,8 @@ class BistraPlugin:
     def __init__(self, *, workers: int, pool: "WorkerPool | None" = None) -> None:
         self.workers = workers
         self.pool = pool
+        self.collection: Collection | None = None
+        self.collection_reporter: _CollectionReporter | None = None
         self.phase_durations: dict[str, dict[str, float]] = {}
 
     @pytest.hookimpl(tryfirst=True)
@@ -360,20 +404,50 @@ class BistraPlugin:
             )
         if self.workers > 1 and (config.option.usepdb or getattr(config.option, "trace", False)):
             raise pytest.UsageError("bistra interactive debugging requires -j 1")
-        if self.pool is not None and config.option.xmlpath:
-            from _pytest.junitxml import LogXML, xml_key
+        from .lifecycle import register_hooks
 
-            # Pytest skips XML on workers; the parent writes the combined report.
-            config.stash[xml_key] = LogXML(
-                config.option.xmlpath,
-                config.option.junitprefix,
-                config.getini("junit_suite_name"),
-                config.getini("junit_logging"),
-                config.getini("junit_duration_report"),
-                config.getini("junit_family"),
-                config.getini("junit_log_passing_tests"),
-            )
-            config.pluginmanager.register(config.stash[xml_key])
+        register_hooks(config)
+        from .fresh import child_context
+
+        if child_context is not None:
+            self.collection_reporter = _CollectionReporter(config)
+            config.pluginmanager.register(self.collection_reporter, "bistra-collection-reporter")
+
+    @pytest.hookimpl(wrapper=True, tryfirst=True)
+    def pytest_sessionstart(self):
+        result = yield
+        if self.pool is not None:
+            try:
+                self.pool.launch()
+            except BaseException:
+                self.pool.close()
+                raise
+        return result
+
+    @pytest.hookimpl(wrapper=True, tryfirst=True)
+    def pytest_sessionfinish(self):
+        # Resource teardown must happen while controller session resources are
+        # still alive, including on collection failure or interruption.
+        try:
+            if self.pool is not None:
+                self.pool.close()
+        finally:
+            result = yield
+        return result
+
+    @pytest.hookimpl(tryfirst=True)
+    def pytest_collection(self, session: pytest.Session) -> bool | None:
+        if self.pool is None:
+            return None
+        # Only workers import test modules and run collection hooks. The
+        # controller needs their agreed inventory, not another set of Items.
+        self.collection = self.pool.collect()
+        session.testscollected = len(self.collection.nodeids)
+        _replay_collection(session.config, self.collection.events)
+        terminal = session.config.pluginmanager.get_plugin("terminalreporter")
+        if terminal and self.collection.deselected:
+            terminal.write_line(f"bistra: {self.collection.deselected} deselected")
+        return True
 
     def pytest_report_header(self):
         return f"bistra: fresh interpreters, {self.workers} execution slots"
@@ -400,10 +474,12 @@ class BistraPlugin:
                 )
             if not config.option.continue_on_collection_errors:
                 return None
-        if not session.items:
-            return None
         if self.workers == 1:
             return None
+        assert self.collection is not None
+        nodeids = self.collection.nodeids
+        if not nodeids:
+            return True
         terminal = cast("TerminalReporter | None", config.pluginmanager.get_plugin("terminalreporter"))
         capman = cast("CaptureManager | None", config.pluginmanager.get_plugin("capturemanager"))
         if capman:
@@ -413,37 +489,20 @@ class BistraPlugin:
         key = hashlib.sha256((str(config.rootpath) + sys.version).encode()).hexdigest()[:24]
         cache_path = Path(os.environ.get("XDG_CACHE_HOME", str(Path.home() / ".cache"))) / "bistra" / f"{key}.json"
         history = load_history(cache_path)
-        indices = list(range(len(session.items)))
-        estimates = {
-            index: history[item.nodeid]["total"] for index, item in enumerate(session.items) if item.nodeid in history
-        }
-        fixture_groups = _fixture_groups(session.items)
+        indices = list(range(len(nodeids)))
+        estimates = {index: history[nodeid]["total"] for index, nodeid in enumerate(nodeids) if nodeid in history}
+        groups = self.collection.groups
         try:
-            groups = prioritize_groups(fixture_groups, estimates) if estimates else fixture_groups
+            estimate_durations(indices, estimates)
         except ValueError:
             # Ignore unusable duration estimates so tests can still run.
             history = {}
             estimates = {}
-            groups = fixture_groups
         measured: dict[str, dict[str, float]] = {}
         worker_exit: ControlEvent | None = None
-        parent_initialized = False
-
-        def execute_parent(index: int, next_index: int | None) -> None:
-            nonlocal parent_initialized
-            if not parent_initialized:
-                # Only set up fixtures after all collections agree.
-                # Keep the parent's normal terminal, capture and session hooks.
-                _initialize_temp_directory(config, base, self.workers - 1)
-                parent_initialized = True
-            item = session.items[index]
-            nextitem = session.items[next_index] if next_index is not None else None
-            config.hook.pytest_runtest_protocol(item=item, nextitem=nextitem)
-            if session.shouldfail or session.shouldstop:
-                raise WorkerStop(str(session.shouldfail or session.shouldstop), completed=True)
 
         def completed(index: int, elapsed: float) -> None:
-            nodeid = session.items[index].nodeid
+            nodeid = nodeids[index]
             phases = self.phase_durations.pop(nodeid, {})
             measured[nodeid] = {
                 "total": elapsed,
@@ -452,8 +511,10 @@ class BistraPlugin:
 
         def event(message: Event) -> bool | None:
             nonlocal worker_exit
+            assert self.pool is not None
             if message["type"] == "report":
                 report = config.hook.pytest_report_from_serializable(config=config, data=message["data"])
+                report.node = self.pool.nodes[message["worker_id"]]
                 config.hook.pytest_runtest_logreport(report=report)
             elif message["type"] == "logstart":
                 config.hook.pytest_runtest_logstart(nodeid=message["nodeid"], location=message["location"])
@@ -469,6 +530,8 @@ class BistraPlugin:
                         "location": message["location"],
                     }
                 )
+            elif message["type"] == "workeroutput":
+                self.pool.nodes[message["worker_id"]].workeroutput = message["data"]
             elif message["type"] == "control":
                 control = message["kind"]
                 if control == "fail":
@@ -483,11 +546,10 @@ class BistraPlugin:
             return None
 
         assert self.pool is not None, "Parallel execution requires collected workers."
-        self.pool.prepare(session, base)
+        self.pool.base = base
         if terminal:
             terminal.write_line(
-                f"bistra: dispatching {len(indices)} tests across {self.workers} "
-                "execution slots (fresh workers + original process)"
+                f"bistra: dispatching {len(indices)} tests across {self.workers} fresh worker processes"
             )
             if estimates:
                 terminal.write_line(f"bistra: using duration history for {len(estimates)}/{len(indices)} tests")
@@ -501,7 +563,6 @@ class BistraPlugin:
             groups=groups,
             estimates=estimates,
             start_worker=self.pool.start_worker,
-            parent_execute=execute_parent,
         )
         try:
             save_history(cache_path, update_history(history, measured))
@@ -512,7 +573,7 @@ class BistraPlugin:
             for crash in result.crashes:
                 if terminal:
                     index = crash.get("index")
-                    nodeid = session.items[index].nodeid if index is not None else "during worker startup or cleanup"
+                    nodeid = nodeids[index] if index is not None else "during worker startup or cleanup"
                     exitcode = crash.get("exitcode")
                     cause = ""
                     if exitcode is not None:

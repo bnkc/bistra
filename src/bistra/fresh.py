@@ -4,6 +4,7 @@ import hashlib
 import json
 import multiprocessing
 import os
+import pickle
 import signal
 import sys
 import tempfile
@@ -13,32 +14,51 @@ from multiprocessing.connection import Connection, wait
 from multiprocessing.process import BaseProcess
 from pathlib import Path
 from types import ModuleType
-from typing import TYPE_CHECKING, NoReturn, cast
+from typing import TYPE_CHECKING, Any, NoReturn, cast
 
 import pytest
 
 from .executor import _signal_group, _worker
+from .lifecycle import WorkerNode
+from .protocol import Event
 from .transport import FramedReceiver, TransportError
 
 if TYPE_CHECKING:
     from .pytest_adapter import BistraPlugin
 
 pool_key = pytest.StashKey["WorkerPool"]()
-child_context: tuple[Connection, int, str, list[int]] | None = None
 COLLECTION_TIMEOUT = 120.0
 
 
-def _manifest(session: pytest.Session) -> str:
-    from .pytest_adapter import _fixture_groups
+@dataclass
+class ChildContext:
+    connection: Connection
+    worker_id: int
+    worker_input: dict[str, Any]
+    original_streams: list[int]
+    worker_output: dict[str, Any]
+    collection_events: list[Event]
 
-    value = ([item.nodeid for item in session.items], _fixture_groups(session.items))
-    return hashlib.sha256(json.dumps(value, separators=(",", ":")).encode()).hexdigest()
+
+child_context: ChildContext | None = None
+
+
+@dataclass
+class Collection:
+    nodeids: list[str]
+    groups: list[list[int]]
+    events: list[Event]
+    deselected: int
+
+    def digest(self) -> str:
+        value = (self.nodeids, self.groups)
+        return hashlib.sha256(json.dumps(value, separators=(",", ":")).encode()).hexdigest()
 
 
 def _main(
     connection: Connection,
     worker_id: int,
-    run_uid: str,
+    worker_input: dict[str, Any],
     args: list[str],
     plugins: list[str],
     log_path: str,
@@ -49,25 +69,34 @@ def _main(
     with open(log_path, "wb", buffering=0) as output:
         for fd in (1, 2):
             os.dup2(output.fileno(), fd)
-    child_context = (connection, worker_id, run_uid, original_streams)
+    worker_output: dict[str, Any] = {}
+    child_context = ChildContext(connection, worker_id, worker_input, original_streams, worker_output, [])
     try:
         status = pytest.main(args, plugins=plugins)
         sys.stdout.flush()
         sys.stderr.flush()
-        connection.send(("collection_error", int(status)))
+        connection.send(("collection_error", int(status), worker_output, child_context.collection_events))
     finally:
         connection.close()
 
 
 def run_child(session: pytest.Session, owner: "BistraPlugin") -> bool:
+    from .pytest_adapter import PytestAdapter, _fixture_groups
+
+    assert owner.collection_reporter is not None
+    reporter = owner.collection_reporter
+    session.config.pluginmanager.unregister(reporter)
+    assert child_context is not None
+    connection, worker_id = child_context.connection, child_context.worker_id
+    original_streams = child_context.original_streams
+    child_context.collection_events = reporter.events
     if session.testsfailed:
         # A child with collection errors must not fall back to pytest's serial loop.
         return True
-    from .pytest_adapter import PytestAdapter
-
-    assert child_context is not None
-    connection, worker_id, _, original_streams = child_context
-    connection.send(("ready", _manifest(session)))
+    collection = Collection(
+        [item.nodeid for item in session.items], _fixture_groups(session.items), [], reporter.deselected
+    )
+    connection.send(("ready", collection.digest(), collection if worker_id == 0 else None, reporter.events))
     job = connection.recv()
     if job is None:
         # No tests were assigned to this worker.
@@ -90,23 +119,45 @@ class _Child:
     process: BaseProcess
     connection: Connection
     log_path: Path
+    node: WorkerNode
     transferred: bool = False
 
 
 class WorkerPool:
-    def __init__(self) -> None:
+    def __init__(self, config: pytest.Config, plugins: list[str]) -> None:
+        self.config = config
+        self.plugins = plugins
+        self.nodes: list[WorkerNode] = []
+        self.closed = False
         self.children: list[_Child] = []
         self.directory = tempfile.TemporaryDirectory(prefix="bistra-startup-")
         self.base: Path | None = None
 
-    def launch(self, count: int, run_uid: str, args: list[str], plugins: list[str]) -> None:
+    def launch(self) -> None:
+        count = self.config.option.bistra_workers
+        run_uid = os.urandom(16).hex()
+        args = list(self.config.invocation_params.args)
         context = multiprocessing.get_context("spawn")
         for worker_id in range(count):
+            node = WorkerNode(
+                self.config,
+                {
+                    "workerid": f"bistra{worker_id}",
+                    "workercount": count,
+                    "testrunuid": run_uid,
+                },
+            )
+            self.nodes.append(node)
+            try:
+                self.config.hook.pytest_configure_node(node=node)
+            except BaseException as error:
+                node.error = str(error)
+                raise
             parent, child = context.Pipe(duplex=True)
             log_path = Path(self.directory.name) / f"worker-{worker_id}.log"
             process = context.Process(
                 target=_main,
-                args=(child, worker_id, run_uid, args, plugins, str(log_path)),
+                args=(child, worker_id, node.workerinput, args, self.plugins, str(log_path)),
                 name=f"bistra-{worker_id}",
             )
             try:
@@ -116,9 +167,10 @@ class WorkerPool:
                 raise
             finally:
                 child.close()
-            self.children.append(_Child(process, parent, log_path))
+            self.children.append(_Child(process, parent, log_path, node))
 
     def _failure(self, child: _Child, message: str) -> NoReturn:
+        child.node.error = message
         try:
             with child.log_path.open("rb") as log:
                 log.seek(0, os.SEEK_END)
@@ -128,8 +180,11 @@ class WorkerPool:
             detail = ""
         raise pytest.UsageError(f"bistra {child.process.name}: {message}\n{detail}")
 
-    def prepare(self, session: pytest.Session, base: Path) -> None:
-        expected = _manifest(session)
+    def collect(self) -> Collection:
+        expected: str | None = None
+        collection: Collection | None = None
+        events: list[Event] = []
+        seen: set[bytes] = set()
         pending = {child.connection: child for child in self.children}
         readers = {connection: FramedReceiver(connection) for connection in pending}
         deadline = time.monotonic() + COLLECTION_TIMEOUT
@@ -139,16 +194,31 @@ class WorkerPool:
                     child = pending[connection]
                     try:
                         for message in readers[connection].receive():
-                            kind, payload = cast(tuple[str, str | int], message)
+                            kind, payload, data, worker_events = cast(tuple[Any, ...], message)
                             if kind != "ready":
+                                from .pytest_adapter import _replay_collection
+
+                                child.node.workeroutput = data
+                                _replay_collection(self.config, worker_events)
                                 self._failure(child, f"collection failed (exit {payload})")
-                            if payload != expected:
+                            if expected is None:
+                                expected = payload
+                            elif payload != expected:
                                 self._failure(
                                     child,
-                                    "collection differs from the original process "
+                                    "collection differs between workers "
                                     "(test order or fixture groups); no tests were executed. "
                                     "Make collection deterministic or use --bistra-workers=1.",
                                 )
+                            if data is not None:
+                                collection = data
+                            # Report shared startup warnings/skips once, while
+                            # preserving diagnostics unique to any worker.
+                            for event in worker_events:
+                                key = pickle.dumps(event)
+                                if key not in seen:
+                                    seen.add(key)
+                                    events.append(event)
                             del pending[connection]
                             break
                     except TransportError as error:
@@ -162,12 +232,14 @@ class WorkerPool:
                 if pending and time.monotonic() >= deadline:
                     self._failure(
                         next(iter(pending.values())),
-                        "collection timed out after the original process finished",
+                        "collection timed out",
                     )
         finally:
             for reader in readers.values():
                 reader.close()
-        self.base = base
+        assert collection is not None
+        collection.events = events
+        return collection
 
     def start_worker(self, worker_id: int, initial: list[int]) -> tuple[BaseProcess, Connection]:
         assert self.base is not None, "Collection must be validated before dispatch."
@@ -177,6 +249,9 @@ class WorkerPool:
         return child.process, child.connection
 
     def close(self) -> None:
+        if self.closed:
+            return
+        self.closed = True
         # Transferred children belong to the executor, which also kills descendants.
         children = [child for child in self.children if not child.transferred]
         for child in children:
@@ -184,8 +259,27 @@ class WorkerPool:
                 child.connection.send(None)
             except (OSError, EOFError):
                 pass
-        for child in children:
-            child.process.join(timeout=0.2)
+        # Drain shutdown messages while joining: an unused worker can still
+        # publish workeroutput from sessionfinish, possibly larger than a pipe.
+        readers = {child.connection: FramedReceiver(child.connection) for child in children}
+        deadline = time.monotonic() + 2
+        try:
+            while children and time.monotonic() < deadline:
+                for child in children:
+                    try:
+                        for message in readers[child.connection].receive():
+                            payload = cast(tuple[Any, ...], message)
+                            if payload[0] == "collection_error":
+                                child.node.workeroutput = payload[2]
+                    except TransportError:
+                        pass
+                    child.process.join(timeout=0)
+                if all(not child.process.is_alive() for child in children):
+                    break
+                time.sleep(0.01)
+        finally:
+            for reader in readers.values():
+                reader.close()
         for signum in (signal.SIGTERM, signal.SIGKILL):
             for child in children:
                 assert child.process.pid is not None
@@ -199,23 +293,29 @@ class WorkerPool:
         for child in children:
             child.connection.close()
         self.directory.cleanup()
+        for child in self.children:
+            if child.process.exitcode and child.node.error is None:
+                child.node.error = f"worker exited with status {child.process.exitcode}"
+        errors = []
+        for node in self.nodes:
+            try:
+                self.config.hook.pytest_testnodedown(node=node, error=node.error)
+            except BaseException as error:
+                errors.append(error)
+        if errors:
+            raise errors[0]
 
 
-def _initialize_worker(config: pytest.Config, worker_id: int, run_uid: str) -> None:
-    """Set worker identity before importing project configuration."""
-    worker_name = f"bistra{worker_id}"
-    worker_input = {
-        "workerid": worker_name,
-        "workercount": config.known_args_namespace.bistra_workers,
-        "testrunuid": run_uid,
-    }
+def _initialize_worker(config: pytest.Config, worker_input: dict[str, Any], worker_output: dict[str, Any]) -> None:
+    """Set identity and controller-provided resources before project imports."""
+    worker_name = worker_input["workerid"]
     patch = pytest.MonkeyPatch()
     config.add_cleanup(patch.undo)
     patch.setattr(config, "workerinput", worker_input, raising=False)
-    patch.setattr(config, "workeroutput", {}, raising=False)
+    patch.setattr(config, "workeroutput", worker_output, raising=False)
     patch.setenv("PYTEST_XDIST_WORKER", worker_name)
     patch.setenv("PYTEST_XDIST_WORKER_COUNT", str(worker_input["workercount"]))
-    patch.setenv("PYTEST_XDIST_TESTRUNUID", run_uid)
+    patch.setenv("PYTEST_XDIST_TESTRUNUID", worker_input["testrunuid"])
 
 
 def start_collection(config: pytest.Config) -> None:
@@ -229,7 +329,7 @@ def start_collection(config: pytest.Config) -> None:
     ):
         return
     if child_context is not None:
-        _initialize_worker(config, child_context[1], child_context[2])
+        _initialize_worker(config, child_context.worker_input, child_context.worker_output)
         return
     if os.name != "posix":
         raise pytest.UsageError("bistra parallel execution currently requires POSIX; use --bistra-workers=1")
@@ -244,11 +344,10 @@ def start_collection(config: pytest.Config) -> None:
                 "bistra fresh workers require importable plugins; pass plugin module names "
                 "to pytest.main or use --bistra-workers=1"
             )
-    pool = WorkerPool()
+    patch = pytest.MonkeyPatch()
+    config.add_cleanup(patch.undo)
+    for name in ("PYTEST_XDIST_WORKER", "PYTEST_XDIST_WORKER_COUNT", "PYTEST_XDIST_TESTRUNUID"):
+        patch.delenv(name, raising=False)
+    pool = WorkerPool(config, plugins)
     config.stash[pool_key] = pool
     config.add_cleanup(pool.close)
-    run_uid = os.urandom(16).hex()
-    # Pass the original args so pytest expands config and environment addopts only once.
-    # Start children before project hooks or the parent change the environment.
-    pool.launch(option.bistra_workers - 1, run_uid, list(config.invocation_params.args), plugins)
-    _initialize_worker(config, option.bistra_workers - 1, run_uid)

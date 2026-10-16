@@ -1,8 +1,7 @@
-"""Prioritize slower test groups without reordering tests within a group."""
+"""Balance fixture groups across workers without changing collection order."""
 
 import heapq
 import math
-from collections import deque
 from collections.abc import Mapping, Sequence
 from typing import SupportsFloat, SupportsIndex, cast
 
@@ -38,52 +37,34 @@ def estimate_durations(indices: Sequence[int], durations: Mapping[int, object]) 
     return weights
 
 
-def prioritize_groups(groups: Sequence[Sequence[int]], durations: Mapping[int, object]) -> list[list[int]]:
-    """Put slower groups first without reordering their tests.
+def plan_workers(
+    indices: Sequence[int],
+    groups: Sequence[Sequence[int]],
+    workers: int,
+    durations: Mapping[int, object],
+) -> list[list[list[int]]]:
+    """Balance whole fixture groups, then restore each worker's collection order.
 
-    Ties keep their input order. Missing or invalid timings use the mean of
-    positive timings from the selected tests, or one second if none are known.
-    Zero is valid; history for other tests is ignored. Groups must be nonempty,
-    and each test index must appear only once.
+    Batches end where affinity groups change. This keeps lookahead accurate while
+    allowing the executor to stop between groups instead of buffering a full run.
     """
-    ordered = [list(group) for group in groups]
-    if any(not group for group in ordered):
-        raise ValueError("job groups must not be empty")
-    indices = [index for group in ordered for index in group]
-    if len(set(indices)) != len(indices):
-        raise ValueError("job identifiers must be unique")
+    if not groups:
+        return []
     weights = estimate_durations(indices, durations)
-
-    return sorted(ordered, key=lambda group: -math.fsum(weights[index] for index in group))
-
-
-class GroupQueue:
-    """Take whole groups in priority order or by shortest estimated duration."""
-
-    def __init__(self, groups: Sequence[Sequence[int]], estimates: Mapping[int, float]) -> None:
-        self._groups = {rank: list(group) for rank, group in enumerate(groups)}
-        self._priority = deque(self._groups)
-        self._shortest = (
-            [(math.fsum(estimates[index] for index in group), rank) for rank, group in self._groups.items()]
-            if estimates
-            else []
-        )
-        heapq.heapify(self._shortest)
-
-    def __len__(self) -> int:
-        return len(self._groups)
-
-    def take(self, *, shortest: bool = False) -> list[int] | None:
-        if not self._groups:
-            return None
-        if shortest and self._shortest:
-            while True:
-                _, rank = heapq.heappop(self._shortest)
-                if rank in self._groups:
-                    break
-        else:
-            while True:
-                rank = self._priority.popleft()
-                if rank in self._groups:
-                    break
-        return self._groups.pop(rank)
+    costs = [math.fsum(weights[index] for index in group) for group in groups]
+    slots = [(0.0, 0, worker) for worker in range(min(workers, len(groups)))]
+    owners = {}
+    for group_id in sorted(range(len(groups)), key=lambda i: -costs[i]):
+        total, count, worker = heapq.heappop(slots)
+        for index in groups[group_id]:
+            owners[index] = (worker, group_id)
+        heapq.heappush(slots, (total + costs[group_id], count + len(groups[group_id]), worker))
+    batches: list[list[list[int]]] = [[] for _ in slots]
+    previous: dict[int, int] = {}
+    for index in indices:
+        worker, group_id = owners[index]
+        if previous.get(worker) != group_id:
+            batches[worker].append([])
+            previous[worker] = group_id
+        batches[worker][-1].append(index)
+    return batches

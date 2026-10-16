@@ -30,7 +30,7 @@ def run(tmp_path, subprocess_env, *args):
         "crash",
         "noisy-crash",
         "timeout",
-        "parent-error",
+        "one-worker-error",
     ],
 )
 def test_collection_problems_run_no_tests_and_reap_workers(tmp_path, subprocess_env, problem):
@@ -62,7 +62,11 @@ def test_collection_problems_run_no_tests_and_reap_workers(tmp_path, subprocess_
             Path("unexpected-test").touch()
     """
     conftest = textwrap.dedent(conftest)
-    scope = '("module" if CHILD else "function")' if problem == "fixtures" else '"function"'
+    scope = (
+        '("module" if os.environ.get("PYTEST_XDIST_WORKER") == "bistra0" else "function")'
+        if problem == "fixtures"
+        else '"function"'
+    )
     conftest += f"\n@pytest.fixture(scope={scope})\ndef resource():\n    return 1\n"
     if problem == "nodeids":
         conftest += "\ndef pytest_collection_modifyitems(items):\n    items[0]._nodeid += str(os.getpid())\n"
@@ -82,13 +86,15 @@ def test_collection_problems_run_no_tests_and_reap_workers(tmp_path, subprocess_
     elif problem == "timeout":
         conftest += (
             "\ndef pytest_collection_finish(session):\n    if CHILD:\n        time.sleep(30)\n"
-            "    else:\n        import bistra.fresh\n        bistra.fresh.COLLECTION_TIMEOUT = 0.15\n"
+            "\ndef pytest_configure(config):\n    if not CHILD:\n"
+            "        import bistra.fresh\n        bistra.fresh.COLLECTION_TIMEOUT = 1.0\n"
         )
-    elif problem == "parent-error":
+    elif problem == "one-worker-error":
         conftest += (
-            "\ndef pytest_collection_finish(session):\n    if not CHILD:\n        deadline = time.monotonic() + 5\n"
-            '        while len(list(Path().glob("collector-*"))) < 3 and time.monotonic() < deadline:\n'
-            '            time.sleep(0.01)\n        raise pytest.UsageError("parent collection evidence")\n'
+            "\ndef pytest_collection_finish(session):\n"
+            '    if os.environ.get("PYTEST_XDIST_WORKER") == "bistra1":\n'
+            "        time.sleep(0.1)\n"
+            '        raise pytest.UsageError("one worker collection evidence")\n'
         )
     (tmp_path / "conftest.py").write_text(conftest)
     test_source = textwrap.dedent(test_source)
@@ -108,7 +114,7 @@ def test_collection_problems_run_no_tests_and_reap_workers(tmp_path, subprocess_
         "crash": "17",
         "noisy-crash": "recent startup evidence: \ufffd",
         "timeout": "collection timed out",
-        "parent-error": "parent collection evidence",
+        "one-worker-error": "one worker collection evidence",
     }[problem]
     assert expected in result.stdout + result.stderr
     if problem == "noisy-crash":
@@ -150,7 +156,10 @@ def test_worker_identity_precedes_project_configuration(tmp_path, subprocess_env
 
         @pytest.hookimpl(tryfirst=True)
         def pytest_load_initial_conftests(early_config):
-            worker = os.environ["PYTEST_XDIST_WORKER"]
+            worker = os.environ.get("PYTEST_XDIST_WORKER")
+            if worker is None:
+                assert not hasattr(early_config, "workerinput")
+                return
             assert early_config.workerinput["workerid"] == worker
             assert os.environ["RESOURCE_PREFIX"] == "original"
             os.environ["RESOURCE_PREFIX"] += "/" + worker
@@ -163,18 +172,20 @@ def test_worker_identity_precedes_project_configuration(tmp_path, subprocess_env
         from pathlib import Path
         import pytest
 
-        IMPORT_IDENTITY = {
-            "workerid": os.environ["PYTEST_XDIST_WORKER"],
-            "workercount": int(os.environ["PYTEST_XDIST_WORKER_COUNT"]),
-            "testrunuid": os.environ["PYTEST_XDIST_TESTRUNUID"],
-        }
+        IMPORT_IDENTITY = None
+        if "PYTEST_XDIST_WORKER" in os.environ:
+            IMPORT_IDENTITY = {
+                "workerid": os.environ["PYTEST_XDIST_WORKER"],
+                "workercount": int(os.environ["PYTEST_XDIST_WORKER_COUNT"]),
+                "testrunuid": os.environ["PYTEST_XDIST_TESTRUNUID"],
+            }
+            Path(f"import-{os.getpid()}.json").write_text(json.dumps(IMPORT_IDENTITY))
         RESOURCE = os.environ["RESOURCE_PREFIX"]
-        assert RESOURCE == "original/" + IMPORT_IDENTITY["workerid"]
-        Path(f"import-{os.getpid()}.json").write_text(json.dumps(IMPORT_IDENTITY))
+        assert RESOURCE == ("original/" + IMPORT_IDENTITY["workerid"] if IMPORT_IDENTITY else "original")
 
         @pytest.hookimpl(tryfirst=True)
         def pytest_configure(config):
-            assert config.workerinput == IMPORT_IDENTITY
+            assert getattr(config, "workerinput", None) == IMPORT_IDENTITY
 
         @pytest.fixture
         def resource(request):
@@ -190,7 +201,7 @@ def test_worker_identity_precedes_project_configuration(tmp_path, subprocess_env
         from pathlib import Path
         import pytest
 
-        COLLECTED_WORKER = os.environ["PYTEST_XDIST_WORKER"]
+        COLLECTED_WORKER = os.environ.get("PYTEST_XDIST_WORKER")
 
         @pytest.mark.parametrize("index", range(12))
         def test_resource(index, request, resource, worker_id, testrun_uid):
@@ -226,7 +237,10 @@ def test_embedded_runs_restore_identity_after_success_and_collection_error(tmp_p
         import pytest
 
         def pytest_configure(config):
-            assert config.workerinput["workerid"] == os.environ["PYTEST_XDIST_WORKER"]
+            if hasattr(config, "workerinput"):
+                assert config.workerinput["workerid"] == os.environ["PYTEST_XDIST_WORKER"]
+            else:
+                assert "PYTEST_XDIST_WORKER" not in os.environ
             if os.environ.get("FAIL_CONFIG"):
                 raise pytest.UsageError("requested configuration failure")
     """)

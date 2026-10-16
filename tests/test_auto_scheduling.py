@@ -45,7 +45,64 @@ def _assert_complete_history(tmp_path, nodeids):
     return history
 
 
-def test_learns_parametrized_durations_then_starts_expensive_tests_on_separate_workers(
+def test_warm_scheduling_preserves_order_between_session_fixture_consumers(tmp_path, subprocess_env):
+    # Like pytest's path1 fixture: a later test moves a directory permanently.
+    # Session fixtures remain per-worker; they must not serialize the suite.
+    (tmp_path / "test_cases.py").write_text(
+        textwrap.dedent("""
+        import os
+        from pathlib import Path
+        import pytest
+
+        @pytest.fixture(scope="session")
+        def shared_path(tmp_path_factory):
+            path = tmp_path_factory.mktemp("shared")
+            (path / "sampledir").mkdir()
+            return path
+
+        def test_visit(shared_path):
+            assert (shared_path / "sampledir").is_dir()
+
+        def test_move(shared_path):
+            (shared_path / "sampledir").rename(shared_path / "moveddir")
+            Path(os.environ["TEST_RECORDS"], "moved").touch()
+
+    """)
+    )
+    (tmp_path / "test_blocker.py").write_text(
+        textwrap.dedent("""
+        import os
+        from pathlib import Path
+        import time
+        import pytest
+
+        @pytest.fixture(scope="module", autouse=True)
+        def resource():
+            yield
+
+        def test_other_worker():
+            deadline = time.monotonic() + 5
+            while not Path(os.environ["TEST_RECORDS"], "moved").exists():
+                assert time.monotonic() < deadline, "tests did not run in parallel"
+                time.sleep(0.001)
+
+        def test_last():
+            pass
+    """)
+    )
+    save_history(
+        _history_path(tmp_path),
+        {
+            "test_cases.py::test_visit": {"total": 1},
+            "test_cases.py::test_move": {"total": 10},
+            "test_blocker.py::test_other_worker": {"total": 100},
+            "test_blocker.py::test_last": {"total": 0},
+        },
+    )
+    _run(tmp_path, subprocess_env)
+
+
+def test_learns_durations_then_balances_expensive_tests_without_reordering(
     tmp_path,
     subprocess_env,
 ):
@@ -102,11 +159,14 @@ def test_learns_parametrized_durations_then_starts_expensive_tests_on_separate_w
         (json.loads(path.read_text()) for path in warm.iterdir()),
         key=lambda row: row["start"],
     )
-    first_per_worker = {}
+    by_worker = {}
     for record in warm_records:
-        first_per_worker.setdefault(record["worker"], record["nodeid"])
-    assert set(first_per_worker.values()) == set(nodeids[-2:])
-    assert len(first_per_worker) == 2
+        by_worker.setdefault(record["worker"], []).append(record["nodeid"])
+    assert len(by_worker) == 2
+    for execution in by_worker.values():
+        assert execution == sorted(execution, key=nodeids.index)
+    expensive = [row for row in warm_records if row["nodeid"] in nodeids[-2:]]
+    assert len({row["worker"] for row in expensive}) == 2
     assert Counter(row["nodeid"] for row in warm_records) == Counter(nodeids)
     _assert_complete_history(tmp_path, nodeids)
 

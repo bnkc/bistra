@@ -16,6 +16,11 @@ class ReportEvent(EventContext):
     data: dict[str, Any]
 
 
+class CollectReportEvent(EventContext):
+    type: Literal["collectreport"]
+    data: dict[str, Any]
+
+
 class LogStartEvent(EventContext):
     type: Literal["logstart"]
     nodeid: str
@@ -43,7 +48,14 @@ class ControlEvent(EventContext):
     returncode: NotRequired[int | None]
 
 
-Event: TypeAlias = ReportEvent | LogStartEvent | LogFinishEvent | WarningEvent | ControlEvent
+class WorkerOutputEvent(EventContext):
+    type: Literal["workeroutput"]
+    data: dict[str, Any]
+
+
+Event: TypeAlias = (
+    WorkerOutputEvent | ReportEvent | CollectReportEvent | LogStartEvent | LogFinishEvent | WarningEvent | ControlEvent
+)
 Emit: TypeAlias = Callable[[Event], None]
 OnEvent: TypeAlias = Callable[[Event], bool | None]
 StartWorker: TypeAlias = Callable[[int, list[int]], tuple[BaseProcess, Connection]]

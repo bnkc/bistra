@@ -31,7 +31,7 @@ def run_pytest(tmp_path, subprocess_env, *, workers=2, args=(), environment=None
     )
 
 
-def test_original_and_fresh_interpreter_overlap_on_their_main_threads(tmp_path, subprocess_env):
+def test_workers_overlap_on_their_main_threads(tmp_path, subprocess_env):
     (tmp_path / "conftest.py").write_text(
         textwrap.dedent("""
         import threading
@@ -83,20 +83,15 @@ def test_original_and_fresh_interpreter_overlap_on_their_main_threads(tmp_path, 
     assert len({str(Path(row["basetemp"]).parent) for row in records}) == 1
 
 
-def test_parent_reports_capture_and_fixture_lifetimes_match_serial(tmp_path, subprocess_env):
+def test_reports_capture_and_fixture_lifetimes_match_serial(tmp_path, subprocess_env):
     (tmp_path / "test_parent.py").write_text(
         textwrap.dedent("""
         import json
-        import multiprocessing
         import os
         import threading
         import pytest
 
         COLLECTION_PID = os.getpid()
-
-        @pytest.fixture(autouse=True)
-        def assert_original_process():
-            assert multiprocessing.parent_process() is None
 
         def record(scope, phase):
             with open(os.environ["LIFECYCLE_RECORD"], "a") as output:
@@ -155,7 +150,7 @@ def test_parent_reports_capture_and_fixture_lifetimes_match_serial(tmp_path, sub
             assert False
     """)
     )
-    # The first fixture group goes to the child; the second goes to the parent.
+    # Both fixture groups must retain their local lifetimes in parallel.
     (tmp_path / "test_00_worker.py").write_text(
         textwrap.dedent("""
         import pytest
@@ -212,17 +207,15 @@ def test_parent_reports_capture_and_fixture_lifetimes_match_serial(tmp_path, sub
     assert sum(outcomes[1].values()) == 12
 
 
-def test_parent_failfast_stops_pending_parent_tests_and_finalizes(tmp_path, subprocess_env):
+def test_failfast_stops_pending_tests_and_finalizes(tmp_path, subprocess_env):
     (tmp_path / "test_parent.py").write_text(
         textwrap.dedent("""
-        import multiprocessing
         from pathlib import Path
         import pytest
 
 
         @pytest.fixture(scope="module", autouse=True)
         def cleanup():
-            assert multiprocessing.parent_process() is None
             yield
             Path("parent-cleaned-up").write_text("yes")
 
@@ -233,7 +226,7 @@ def test_parent_failfast_stops_pending_parent_tests_and_finalizes(tmp_path, subp
             Path("unexpected-parent-test").write_text("ran")
     """)
     )
-    # Reserve the earlier module for the child, leaving the failure in the parent.
+    # A second group exercises failfast while another worker is active.
     (tmp_path / "test_00_worker.py").write_text(
         textwrap.dedent("""
         import pytest

@@ -4,7 +4,6 @@ Workers exchange job indices and events. Looking one job ahead preserves
 fixture scopes between groups.
 """
 
-import math
 import os
 import signal
 import subprocess
@@ -21,7 +20,7 @@ from queue import Empty, SimpleQueue
 from typing import Literal, cast
 
 from .protocol import Event, OnEvent, StartWorker, WorkerAdapter, WorkerFailure, WorkerMessage
-from .scheduling import GroupQueue, estimate_durations
+from .scheduling import plan_workers
 from .transport import FramedReceiver, TransportError
 
 _clock = time.perf_counter
@@ -204,20 +203,18 @@ def execute_parallel(
     workers: int,
     groups: list[list[int]],
     start_worker: StartWorker,
-    parent_execute: Callable[[int, int | None], None],
+    parent_execute: Callable[[int, int | None], None] | None = None,
     on_event: OnEvent,
     on_complete: Callable[[int, float], None] | None = None,
     estimates: Mapping[int, object] | None = None,
 ) -> PoolResult:
-    """Run each job once, assigning groups as workers become available.
+    """Run duration-balanced assignments in collection order on each worker.
 
-    Each group stays together, with its jobs in collection order. Every job
-    must appear in exactly one group. Initial groups follow the supplied order;
-    the rest stay available until a worker needs its next group for lookahead.
-    With timing estimates, workers with more work left reserve shorter groups,
-    leaving longer groups for workers that can start them sooner.
+    Fixture groups constrain assignment, not execution order. Worker queues are
+    fixed before execution; batches preserve lookahead and bounded stop handling.
 
-    The worker count includes the calling process. Callbacks run on the calling
+    The worker count includes the calling process only when parent_execute is
+    supplied. Otherwise all execution slots are children. Callbacks run on the calling
     thread while a coordinator handles child messages. start_worker(worker_id,
     initial) returns a ready process and connection, reusing workers that have
     already collected their tests.
@@ -236,8 +233,7 @@ def execute_parallel(
         ranks = [positions[index] for index in group]
         if ranks != sorted(ranks):
             raise ValueError("each group must preserve the original indices order")
-    weights = estimate_durations(indices, estimates) if estimates else {}
-    pending_groups = GroupQueue(groups, weights)
+    plans = [deque(batches) for batches in plan_workers(indices, groups, workers, estimates or {})]
     parent_group: deque[int] = deque()
     result = PoolResult()
     if not indices:
@@ -246,7 +242,7 @@ def execute_parallel(
     receivers: dict[Connection, FramedReceiver] = {}
     active: dict[Connection, int | None] = {}
     assigned: dict[object, set[int]] = {}
-    running: dict[object, tuple[int, float]] = {}
+    queues: dict[object, deque[list[int]]] = {}
     parent_slot = object()
     assigned[parent_slot] = set()
     stopping = False
@@ -283,34 +279,19 @@ def execute_parallel(
                 assert on_complete is not None
                 on_complete(*callback[1])
 
-    def remaining(owner: object, now: float) -> float:
-        duration = math.fsum(weights[index] for index in assigned[owner])
-        if owner in running:
-            index, start = running[owner]
-            if index in assigned[owner]:
-                duration -= min(weights[index], max(0.0, now - start))
-        return max(0.0, duration)
-
     def take_group(owner: object) -> list[int] | None:
-        # The caller holds state_lock so completions cannot race with reservations.
-        shortest = False
-        if weights and pending_groups:
-            now = _clock()
-            ready = remaining(owner, now)
-            shortest = any(
-                jobs and other is not owner and remaining(other, now) < ready for other, jobs in assigned.items()
-            )
-        return pending_groups.take(shortest=shortest)
+        queue = queues.get(owner)
+        return queue.popleft() if queue else None
 
     def take_parent_job() -> int | None:
         with state_lock:
             if stopping:
                 return None
-            if not parent_group and pending_groups:
+            if not parent_group:
                 group = take_group(parent_slot)
-                assert group is not None
-                parent_group.extend(group)
-                assigned[parent_slot].update(group)
+                if group:
+                    parent_group.extend(group)
+                    assigned[parent_slot].update(group)
             return parent_group.popleft() if parent_group else None
 
     def stop_processes(signum: int) -> list[int]:
@@ -375,8 +356,6 @@ def execute_parallel(
                             if payload not in assigned[connection]:
                                 raise TransportError(f"worker started unassigned job {payload}")
                             active[connection] = payload
-                            with state_lock:
-                                running[connection] = (payload, _clock())
                         elif message[0] == "done":
                             index, elapsed, events = message[1]
                             if index in result.completed or index not in assigned[connection]:
@@ -384,7 +363,6 @@ def execute_parallel(
                             with state_lock:
                                 result.completed.add(index)
                                 assigned[connection].discard(index)
-                                running.pop(connection, None)
                             worker_events(events)
                             worker_completed(index, elapsed)
                         elif message[0] == "finished":
@@ -431,17 +409,16 @@ def execute_parallel(
 
     def run_parent() -> None:
         nonlocal stopping
-        index = take_parent_job()
+        index = take_parent_job() if parent_execute is not None else None
         while index is not None:
             drain_callbacks()
             if stopping:
                 break
             next_index = take_parent_job()
             start = _clock()
-            with state_lock:
-                running[parent_slot] = (index, start)
             complete = True
             try:
+                assert parent_execute is not None
                 parent_execute(index, next_index)
             except WorkerStop as error:
                 complete = error.completed
@@ -450,7 +427,6 @@ def execute_parallel(
                 with state_lock:
                     result.completed.add(index)
                     assigned[parent_slot].discard(index)
-                    running.pop(parent_slot, None)
                 if on_complete is not None:
                     on_complete(index, _clock() - start)
             drain_callbacks()
@@ -466,21 +442,19 @@ def execute_parallel(
             raise coordinator_errors[0]
 
     try:
-        for worker_id in range(min(workers - 1, len(pending_groups))):
-            initial = pending_groups.take()
-            assert initial is not None
+        child_count = min(workers - (parent_execute is not None), len(plans))
+        for worker_id in range(child_count):
+            queue = plans[worker_id]
+            initial = queue.popleft()
             process, parent = start_worker(worker_id, initial)
             processes[parent] = process
             active[parent] = None
             assigned[parent] = set(initial)
+            queues[parent] = queue
         # Read without blocking while keeping Connection.send blocking.
         receivers = {connection: FramedReceiver(connection) for connection in active}
-        if pending_groups:
-            # Give every slot its initial priority group before lookahead.
-            initial = pending_groups.take()
-            assert initial is not None
-            parent_group.extend(initial)
-            assigned[parent_slot].update(initial)
+        if parent_execute is not None and child_count < len(plans):
+            queues[parent_slot] = plans[child_count]
         if active:
             coordinator = threading.Thread(target=coordinate_in_thread, name="bistra-coordinator")
             coordinator.start()

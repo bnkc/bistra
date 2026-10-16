@@ -23,6 +23,18 @@ uv run bistra
 Each worker collects tests independently and runs its own session fixtures.
 Collection must be consistent across workers, and tests need to isolate shared
 databases and files. The `worker_id` and `testrun_uid` fixtures can help with that.
+The controller schedules the workers' agreed inventory without collecting the
+suite again.
+
+Duration history balances fixture groups across workers. Each worker runs its
+assigned tests in collection order, including between groups. Assignments are
+fixed for the run; workers can still finish in any order.
+
+The controller runs project setup before starting workers. Existing
+`pytest_configure_node` hooks can populate `node.workerinput`; workers return
+`config.workeroutput` to `pytest_testnodedown` for cleanup. Shared resources stay
+available until workers finish. This supports local resource hooks, not xdist
+gateways or custom xdist schedulers.
 
 Don't combine Bistra with xdist worker options. Compatibility with coverage,
 Testmon, and other plugins that control test execution hasn't been verified yet.

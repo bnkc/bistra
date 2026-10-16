@@ -93,10 +93,11 @@ def _run(tmp_path, subprocess_env, arguments, *, autoload=False, expected_worker
     (tmp_path / "pytest.ini").write_text("[pytest]\n")
     (tmp_path / "conftest.py").write_text("""
 import json
+import multiprocessing
 import os
 from pathlib import Path
 
-assert ("PYTEST_XDIST_WORKER" in os.environ) == (int(os.environ["BISTRA_EXPECT_WORKERS"]) > 1)
+assert ("PYTEST_XDIST_WORKER" in os.environ) == (multiprocessing.parent_process() is not None)
 
 def pytest_collection_modifyitems(session):
     destination = Path(f"collection-{os.getpid()}.json")

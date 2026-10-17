@@ -20,6 +20,55 @@ def run(tmp_path, subprocess_env, *args):
     )
 
 
+@pytest.mark.parametrize("capture", ["fd", "sys", "no"])
+def test_original_stdin_is_usable_without_bypassing_pytest_capture(tmp_path, subprocess_env, capture):
+    (tmp_path / "conftest.py").write_text(
+        textwrap.dedent("""
+        import multiprocessing
+        import os
+        from pathlib import Path
+        import sys
+
+        if multiprocessing.parent_process() is not None:
+            assert not sys.__stdin__.closed
+            assert sys.__stdin__.fileno() >= 0
+            assert not sys.__stdin__.isatty()
+            assert sys.__stdin__.read() == ""
+            Path(f"stdin-ready-{os.getpid()}").touch()
+    """)
+    )
+    (tmp_path / "test_stdin.py").write_text(
+        textwrap.dedent("""
+        import os
+        import sys
+        import pytest
+
+        @pytest.mark.parametrize("case", range(4))
+        def test_stdin(case):
+            assert not sys.__stdin__.closed
+            assert sys.__stdin__.fileno() >= 0
+            assert not sys.__stdin__.isatty()
+            assert sys.__stdin__.read() == ""
+            if os.environ["EXPECTED_CAPTURE"] == "no":
+                assert sys.stdin.read() == ""
+            else:
+                with pytest.raises(OSError, match="reading from stdin"):
+                    sys.stdin.read()
+
+        def test_explicit_capture(capsys):
+            print("captured stdout")
+            print("captured stderr", file=sys.stderr)
+            captured = capsys.readouterr()
+            assert captured.out == "captured stdout\\n"
+            assert captured.err == "captured stderr\\n"
+    """)
+    )
+    result = run(tmp_path, {**subprocess_env, "EXPECTED_CAPTURE": capture}, f"--capture={capture}")
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "5 passed" in result.stdout
+    assert len(list(tmp_path.glob("stdin-ready-*"))) == 3
+
+
 @pytest.mark.parametrize(
     "problem",
     [

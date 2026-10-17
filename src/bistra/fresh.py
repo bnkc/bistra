@@ -24,6 +24,8 @@ from .protocol import Event
 from .transport import FramedReceiver, TransportError
 
 if TYPE_CHECKING:
+    from io import TextIOWrapper
+
     from .pytest_adapter import BistraPlugin
 
 pool_key = pytest.StashKey["WorkerPool"]()
@@ -64,6 +66,10 @@ def _main(
     log_path: str,
 ) -> None:
     global child_context
+    # multiprocessing replaces stdin with /dev/null but leaves __stdin__ closed.
+    # Repair the original-stream reference before pytest or project imports.
+    if sys.__stdin__ is not None and sys.__stdin__.closed:
+        sys.__stdin__ = cast("TextIOWrapper", sys.stdin)
     os.setsid()
     original_streams = [os.dup(fd) for fd in (1, 2)]
     with open(log_path, "wb", buffering=0) as output:

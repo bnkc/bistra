@@ -1,4 +1,4 @@
-# 🐇 Bistra
+# <img src=".github/assets/bistra.svg" alt="" width="96" height="57"> Bistra
 
 > **Pre-alpha.** Bistra is a work in progress. Expect bugs, missing features, and
 > breaking changes. It's ready to experiment with, but not to rely on yet.

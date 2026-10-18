@@ -9,6 +9,67 @@ import textwrap
 import pytest
 
 
+def test_embedded_entry_point_imports_follow_controller_setup(tmp_path, subprocess_env):
+    """Spawn reimports the caller before entering Bistra's worker function."""
+    (tmp_path / "pytest.ini").write_text("[pytest]\n")
+    (tmp_path / "embedded.py").write_text(
+        textwrap.dedent("""
+        import os
+        from pathlib import Path
+        import pytest
+
+        if __name__ == "__mp_main__":
+            # Application imports in an embedded runner can depend on resources
+            # and environment provided by controller hooks, before _main runs.
+            assert Path(os.environ["ENTRYPOINT_RESOURCE"]).read_text() == "ready"
+            Path(f"entrypoint-{os.getpid()}").touch()
+
+        if __name__ == "__main__":
+            raise SystemExit(pytest.main([
+                "-p", "bistra.plugin", "--bistra", "--bistra-workers=2", "-q",
+            ]))
+    """)
+    )
+    (tmp_path / "conftest.py").write_text(
+        textwrap.dedent("""
+        import os
+        from pathlib import Path
+
+        def pytest_sessionstart(session):
+            if not hasattr(session.config, "workerinput"):
+                resource = Path("shared-resource").resolve()
+                resource.write_text("ready")
+                os.environ["ENTRYPOINT_RESOURCE"] = str(resource)
+
+        def pytest_sessionfinish(session):
+            if not hasattr(session.config, "workerinput"):
+                Path("shared-resource").unlink()
+    """)
+    )
+    (tmp_path / "test_resource.py").write_text(
+        textwrap.dedent("""
+        import os
+        from pathlib import Path
+
+        def test_resource():
+            assert Path(os.environ["ENTRYPOINT_RESOURCE"]).read_text() == "ready"
+    """)
+    )
+    env = {key: value for key, value in subprocess_env.items() if key != "ENTRYPOINT_RESOURCE"}
+    result = subprocess.run(
+        [sys.executable, "embedded.py"],
+        cwd=tmp_path,
+        env=env,
+        text=True,
+        capture_output=True,
+        timeout=20,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "1 passed" in result.stdout
+    assert len(list(tmp_path.glob("entrypoint-*"))) == 2
+    assert not (tmp_path / "shared-resource").exists()
+
+
 @pytest.mark.parametrize(
     "failure", ["none", "provision", "configure", "collect", "test", "crash", "finish", "release", "idle"]
 )

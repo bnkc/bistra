@@ -5,8 +5,8 @@
 
 **Less waiting for pytest.**
 
-Bistra runs your tests in parallel and uses timings from previous runs to start
-the slowest groups first. You get pytest's assertions, fixtures, and reports,
+Bistra runs your tests in parallel and uses timings from previous runs to balance
+work across workers. You get pytest's assertions, fixtures, and reports,
 with pytest as the only runtime dependency.
 
 ## Try it
@@ -27,8 +27,9 @@ The controller schedules the workers' agreed inventory without collecting the
 suite again.
 
 Duration history balances fixture groups across workers. Each worker runs its
-assigned tests in collection order, including between groups. Assignments are
-fixed for the run; workers can still finish in any order.
+assigned tests in collection order, including between groups. Unstarted groups
+can move to a worker with less work remaining, provided that preserves its
+collection order. Once dispatched, a fixture group stays on the same worker.
 
 The controller runs project setup before starting workers. Existing
 `pytest_configure_node` hooks can populate `node.workerinput`; workers return

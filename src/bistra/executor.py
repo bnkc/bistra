@@ -20,7 +20,7 @@ from queue import Empty, SimpleQueue
 from typing import Literal, cast
 
 from .protocol import Event, OnEvent, StartWorker, WorkerAdapter, WorkerFailure, WorkerMessage
-from .scheduling import plan_workers
+from .scheduling import WorkScheduler, plan_workers
 from .transport import FramedReceiver, TransportError
 
 _clock = time.perf_counter
@@ -210,8 +210,8 @@ def execute_parallel(
 ) -> PoolResult:
     """Run duration-balanced assignments in collection order on each worker.
 
-    Fixture groups constrain assignment, not execution order. Worker queues are
-    fixed before execution; batches preserve lookahead and bounded stop handling.
+    Fixture groups constrain assignment, not execution order. Unstarted groups
+    can move between workers while preserving order, lookahead and stop handling.
 
     The worker count includes the calling process only when parent_execute is
     supplied. Otherwise all execution slots are children. Callbacks run on the calling
@@ -233,7 +233,8 @@ def execute_parallel(
         ranks = [positions[index] for index in group]
         if ranks != sorted(ranks):
             raise ValueError("each group must preserve the original indices order")
-    plans = [deque(batches) for batches in plan_workers(indices, groups, workers, estimates or {})]
+    plans = plan_workers(indices, groups, workers, estimates or {})
+    scheduler = WorkScheduler(indices, groups, plans, estimates or {})
     parent_group: deque[int] = deque()
     result = PoolResult()
     if not indices:
@@ -242,7 +243,7 @@ def execute_parallel(
     receivers: dict[Connection, FramedReceiver] = {}
     active: dict[Connection, int | None] = {}
     assigned: dict[object, set[int]] = {}
-    queues: dict[object, deque[list[int]]] = {}
+    slots: dict[object, int] = {}
     parent_slot = object()
     assigned[parent_slot] = set()
     stopping = False
@@ -280,8 +281,8 @@ def execute_parallel(
                 on_complete(*callback[1])
 
     def take_group(owner: object) -> list[int] | None:
-        queue = queues.get(owner)
-        return queue.popleft() if queue else None
+        slot = slots.get(owner)
+        return scheduler.take(slot, _clock()) if slot is not None else None
 
     def take_parent_job() -> int | None:
         with state_lock:
@@ -356,6 +357,8 @@ def execute_parallel(
                             if payload not in assigned[connection]:
                                 raise TransportError(f"worker started unassigned job {payload}")
                             active[connection] = payload
+                            with state_lock:
+                                scheduler.started(slots[connection], payload, _clock())
                         elif message[0] == "done":
                             index, elapsed, events = message[1]
                             if index in result.completed or index not in assigned[connection]:
@@ -363,6 +366,7 @@ def execute_parallel(
                             with state_lock:
                                 result.completed.add(index)
                                 assigned[connection].discard(index)
+                                scheduler.completed(slots[connection], index)
                             worker_events(events)
                             worker_completed(index, elapsed)
                         elif message[0] == "finished":
@@ -416,6 +420,8 @@ def execute_parallel(
                 break
             next_index = take_parent_job()
             start = _clock()
+            with state_lock:
+                scheduler.started(slots[parent_slot], index, start)
             complete = True
             try:
                 assert parent_execute is not None
@@ -427,6 +433,7 @@ def execute_parallel(
                 with state_lock:
                     result.completed.add(index)
                     assigned[parent_slot].discard(index)
+                    scheduler.completed(slots[parent_slot], index)
                 if on_complete is not None:
                     on_complete(index, _clock() - start)
             drain_callbacks()
@@ -444,17 +451,17 @@ def execute_parallel(
     try:
         child_count = min(workers - (parent_execute is not None), len(plans))
         for worker_id in range(child_count):
-            queue = plans[worker_id]
-            initial = queue.popleft()
+            initial = scheduler.take(worker_id, _clock(), rebalance=False)
+            assert initial is not None
             process, parent = start_worker(worker_id, initial)
             processes[parent] = process
             active[parent] = None
             assigned[parent] = set(initial)
-            queues[parent] = queue
+            slots[parent] = worker_id
         # Read without blocking while keeping Connection.send blocking.
         receivers = {connection: FramedReceiver(connection) for connection in active}
         if parent_execute is not None and child_count < len(plans):
-            queues[parent_slot] = plans[child_count]
+            slots[parent_slot] = child_count
         if active:
             coordinator = threading.Thread(target=coordinate_in_thread, name="bistra-coordinator")
             coordinator.start()

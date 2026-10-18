@@ -45,6 +45,94 @@ def _assert_complete_history(tmp_path, nodeids):
     return history
 
 
+@pytest.mark.parametrize("scope", ["module", "class", "package", "session"])
+def test_learned_cheap_fixtures_replicate_with_normal_lifetimes_and_order(tmp_path, subprocess_env, scope):
+    package = tmp_path / "cases"
+    package.mkdir()
+    (package / "__init__.py").touch()
+    (package / "conftest.py").write_text(
+        textwrap.dedent("""
+        import json
+        import os
+        from pathlib import Path
+        import pytest
+
+        def record(event, value, case=None):
+            with Path(os.environ["TEST_RECORDS"], str(os.getpid())).open("a") as stream:
+                stream.write(json.dumps([event, value, case]) + "\\n")
+
+        @pytest.fixture(scope=SCOPE, params=["red", "blue"])
+        def resource(request):
+            seen = []
+            record("setup", request.param)
+            yield request.param, seen
+            record("teardown", request.param)
+    """).replace("SCOPE", repr(scope))
+    )
+    (package / "test_cases.py").write_text(
+        textwrap.dedent("""
+        import time
+        import pytest
+        from .conftest import record
+
+        class TestCases:
+            @pytest.mark.parametrize("case", range(8))
+            def test_case(self, resource, case):
+                value, seen = resource
+                assert not seen or case > seen[-1]
+                seen.append(case)
+                record("call", value, case)
+                time.sleep(0.02)
+    """)
+    )
+    cold = _run(tmp_path, subprocess_env, run="cold", workers=4)
+    warm = _run(tmp_path, subprocess_env, run="warm", workers=4)
+    assert len(list(warm.iterdir())) > len(list(cold.iterdir()))
+    for records in (cold, warm):
+        calls = []
+        for path in records.iterdir():
+            events = [json.loads(line) for line in path.read_text().splitlines()]
+            for value in ("red", "blue"):
+                scoped = [event for event in events if event[1] == value]
+                if not scoped:
+                    continue
+                assert [event[0] for event in scoped] == ["setup", *["call"] * (len(scoped) - 2), "teardown"]
+                cases = [event[2] for event in scoped[1:-1]]
+                assert cases == sorted(cases)
+                calls.extend((value, case) for case in cases)
+        assert sorted(calls) == sorted((value, case) for value in ("red", "blue") for case in range(8))
+
+
+def test_explicit_groups_span_files_and_support_composite_marks_without_xdist(tmp_path, subprocess_env):
+    source = """
+        import os
+        from pathlib import Path
+        import pytest
+
+        MARKS
+        def test_case():
+            Path(os.environ["TEST_RECORDS"], NAME).write_text(str(os.getpid()))
+    """
+    marks = {
+        "a": '@pytest.mark.xdist_group("shared")',
+        "b": '@pytest.mark.xdist_group(name="shared")',
+        "c": '@pytest.mark.xdist_group("one")\n@pytest.mark.xdist_group("two")',
+        "d": '@pytest.mark.xdist_group("two")\n@pytest.mark.xdist_group(name="one")',
+        "e": "@pytest.mark.xdist_group",
+        "f": '@pytest.mark.xdist_group("default")',
+    }
+    for name, decorators in marks.items():
+        (tmp_path / f"test_{name}.py").write_text(
+            textwrap.dedent(source).replace("MARKS", decorators).replace("NAME", repr(name))
+        )
+    env = {**subprocess_env, "PYTEST_ADDOPTS": "--strict-markers"}
+    for run in ("cold", "warm"):
+        records = _run(tmp_path, env, run=run, workers=4)
+        assert {path.name for path in records.iterdir()} == set(marks)
+        for first, second in (("a", "b"), ("c", "d"), ("e", "f")):
+            assert (records / first).read_text() == (records / second).read_text()
+
+
 def test_warm_scheduling_preserves_order_between_session_fixture_consumers(tmp_path, subprocess_env):
     # Like pytest's path1 fixture: a later test moves a directory permanently.
     # Session fixtures remain per-worker; they must not serialize the suite.

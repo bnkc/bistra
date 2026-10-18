@@ -5,7 +5,7 @@ from collections import deque
 
 import pytest
 
-from bistra.scheduling import WorkScheduler, estimate_durations, plan_workers
+from bistra.scheduling import WorkScheduler, estimate_durations, plan_workers, refine_fixture_groups
 
 
 def test_balances_expensive_tests_without_reversing_execution():
@@ -46,6 +46,72 @@ def test_worker_count_is_bounded_by_affinity_groups():
 def test_unrepresentable_total_is_rejected():
     with pytest.raises(ValueError, match="too large"):
         estimate_durations([0, 1], {0: 1e308, 1: 1e308})
+
+
+def test_cheap_fixture_locality_can_use_all_workers():
+    indices = list(range(8))
+    history = {i: {"total": 1, "setup": 0.001, "teardown": 0.001} for i in indices}
+    assert refine_fixture_groups(indices, [indices], [], 8, history) == [[i] for i in indices]
+
+
+@pytest.mark.parametrize("record", [{}, {"total": 1}, {"total": 1, "setup": 0.6, "teardown": 0.3}])
+def test_cold_incomplete_and_expensive_fixture_groups_stay_together(record):
+    indices = list(range(8))
+    assert refine_fixture_groups(indices, [indices], [], 8, dict.fromkeys(indices, record)) == [indices]
+
+
+@pytest.mark.parametrize("missing", [None, -1, float("nan"), float("inf"), True])
+def test_one_unknown_fixture_cost_preserves_the_whole_group(missing):
+    history = {i: {"total": 1, "setup": 0.001, "teardown": 0.001} for i in range(3)}
+    history[1]["setup"] = missing
+    assert refine_fixture_groups([0, 1, 2], [[0, 1, 2]], [], 3, history) == [[0, 1, 2]]
+
+
+def test_replication_cost_limits_useful_parallelism():
+    indices = list(range(8))
+    history = {i: {"total": 1, "setup": 0.1, "teardown": 0} for i in indices}
+    groups = refine_fixture_groups(indices, [indices], [], 8, history)
+    assert groups == [[0, 4], [1, 5], [2, 6], [3, 7]]
+
+
+def test_does_not_replicate_fixtures_when_other_work_already_fills_the_workers():
+    indices = list(range(8))
+    history = {i: {"total": 1, "setup": 0.001, "teardown": 0.001} for i in indices}
+    groups = [[0, 1], [2, 3], [4, 5], [6, 7]]
+    assert refine_fixture_groups(indices, groups, [], 4, history) == groups
+    # A long indivisible test remains the limit even with more workers.
+    history[7]["total"] = 5
+    groups = [[0, 1, 2, 3], [4], [5], [6], [7]]
+    assert refine_fixture_groups(indices, groups, [], 8, history) == groups
+
+
+def test_stops_splitting_once_the_rest_of_the_suite_becomes_the_limit():
+    indices = list(range(12))
+    history = {i: {"total": 1, "setup": 0.001, "teardown": 0.001} for i in indices}
+    groups = [[0, 1, 2, 3, 4, 5], *[[i] for i in range(6, 12)]]
+    refined = refine_fixture_groups(indices, groups, [], 4, history)
+    assert refined == [[0, 2, 4], [1, 3, 5], *[[i] for i in range(6, 12)]]
+
+
+@pytest.mark.parametrize("warm", [False, True])
+def test_explicit_groups_cross_fixture_boundaries_and_preserve_non_numeric_collection_order(warm):
+    indices = [7, 4, 9, 2, 6, 1]
+    history = {i: {"total": 1, "setup": 0, "teardown": 0} for i in indices} if warm else {}
+    groups = refine_fixture_groups(indices, [[7, 9, 6], [4, 2, 1]], [[7, 4], [9, 2]], 8, history)
+    assert sorted(i for group in groups for i in group) == sorted(indices)
+    assert all(group == sorted(group, key=indices.index) for group in groups)
+    owners = {i: owner for owner, group in enumerate(groups) for i in group}
+    assert owners[7] == owners[4]
+    assert owners[9] == owners[2]
+    assert len(groups) == (3 if warm else 1)
+
+
+def test_explicit_group_and_single_worker_cannot_split():
+    indices = list(range(8))
+    history = {i: {"total": 1, "setup": 0, "teardown": 0} for i in indices}
+    assert refine_fixture_groups(indices, [indices], [indices], 8, history) == [indices]
+    assert refine_fixture_groups(indices, [indices], [], 1, history) == [indices]
+    assert refine_fixture_groups([], [], [], 8, {}) == []
 
 
 def test_early_finisher_can_help_before_passing_unstarted_groups():

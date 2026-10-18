@@ -28,10 +28,12 @@ databases and files. The `worker_id` and `testrun_uid` fixtures can help with th
 The controller schedules the workers' agreed inventory without collecting the
 suite again.
 
-Duration history balances fixture groups across workers. Each worker runs its
-assigned tests in collection order, including between groups. Unstarted groups
-can move to a worker with less work remaining, provided that preserves its
-collection order. Once dispatched, a fixture group stays on the same worker.
+Duration history balances work across workers. A fixture group that limits
+parallelism may be split when the predicted gain outweighs repeated setup and
+teardown. Cold runs retain fixture locality; `xdist_group` marks always keep
+tests together. Each worker runs its assigned tests in collection order.
+Unstarted groups can move to a worker with less work remaining, provided that
+preserves its collection order. Once dispatched, a group stays on the same worker.
 
 The controller runs project setup before starting workers. Existing
 `pytest_configure_node` hooks can populate `node.workerinput`; workers return

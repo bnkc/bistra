@@ -49,11 +49,12 @@ child_context: ChildContext | None = None
 class Collection:
     nodeids: list[str]
     groups: list[list[int]]
+    required_groups: list[list[int]]
     events: list[Event]
     deselected: int
 
     def digest(self) -> str:
-        value = (self.nodeids, self.groups)
+        value = (self.nodeids, self.groups, self.required_groups)
         return hashlib.sha256(json.dumps(value, separators=(",", ":")).encode()).hexdigest()
 
 
@@ -87,7 +88,7 @@ def _main(
 
 
 def run_child(session: pytest.Session, owner: "BistraPlugin") -> bool:
-    from .pytest_adapter import PytestAdapter, _fixture_groups
+    from .pytest_adapter import PytestAdapter, _explicit_groups, _fixture_groups
 
     assert owner.collection_reporter is not None
     reporter = owner.collection_reporter
@@ -100,7 +101,11 @@ def run_child(session: pytest.Session, owner: "BistraPlugin") -> bool:
         # A child with collection errors must not fall back to pytest's serial loop.
         return True
     collection = Collection(
-        [item.nodeid for item in session.items], _fixture_groups(session.items), [], reporter.deselected
+        [item.nodeid for item in session.items],
+        _fixture_groups(session.items),
+        _explicit_groups(session.items),
+        [],
+        reporter.deselected,
     )
     connection.send(("ready", collection.digest(), collection if worker_id == 0 else None, reporter.events))
     job = connection.recv()

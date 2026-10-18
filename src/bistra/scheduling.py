@@ -71,6 +71,89 @@ def plan_workers(
     return batches
 
 
+def refine_fixture_groups(
+    indices: Sequence[int],
+    groups: Sequence[Sequence[int]],
+    required: Sequence[Sequence[int]],
+    workers: int,
+    history: Mapping[int, Mapping[str, float]],
+) -> list[list[int]]:
+    """Trade ordinary fixture reuse for parallelism when history makes it cheap.
+
+    Required groups are indivisible. Ordinary scoped fixtures may have one
+    instance per worker, just as session fixtures do. Without complete timing
+    history, keep the original locality. For each extra replica, charge the
+    *entire* group's measured setup and teardown, including function fixtures:
+    a deliberately conservative estimate, without guessing fixture identities.
+    """
+    roots = {index: index for index in indices}
+
+    def root(index: int) -> int:
+        while roots[index] != index:
+            roots[index] = roots[roots[index]]
+            index = roots[index]
+        return index
+
+    def combine(collections: Sequence[Sequence[int]]) -> list[list[int]]:
+        for members in collections:
+            for index in members[1:]:
+                roots[root(index)] = root(members[0])
+        combined: dict[int, list[int]] = {}
+        for index in indices:
+            combined.setdefault(root(index), []).append(index)
+        return list(combined.values())
+
+    # Explicit groups may cross fixture boundaries. Merge those boundaries for
+    # locality, but retain the explicit groups themselves as indivisible atoms.
+    atoms = combine(required)
+    atom_for = {index: atom for atom in atoms for index in atom}
+    locality = combine(groups)
+    weights = estimate_durations(indices, {i: record["total"] for i, record in history.items() if "total" in record})
+    # Replication cannot beat the suite's average worker load or its longest
+    # indivisible group. Below that floor, extra fixtures buy no parallelism.
+    floor = max(
+        math.fsum(weights.values()) / max(workers, 1),
+        max((math.fsum(weights[i] for i in atom) for atom in atoms), default=0.0),
+    )
+    result: list[list[int]] = []
+    for members in locality:
+        parts = [atom_for[index] for index in members if atom_for[index][0] == index]
+        if workers < 2 or len(parts) < 2:
+            result.append(members)
+            continue
+        best = [members]
+        cost = math.fsum(weights[index] for index in members)
+        if cost <= floor:
+            result.append(members)
+            continue
+        phases = [
+            _valid_duration(history.get(index, {}).get(phase))
+            for index in members
+            for phase in ("total", "setup", "teardown")
+        ]
+        if all(value is not None for value in phases):
+            # Setup/teardown are an upper estimate of the reusable portion. Do
+            # not subtract them from test weights; the original instance still
+            # has to run. Saturate implausibly large phase totals at group cost.
+            overhead = 0.0
+            for index in members:
+                overhead = min(cost, overhead + history[index]["setup"] + history[index]["teardown"])
+            best_cost = cost
+            largest = max(math.fsum(weights[i] for i in part) for part in parts)
+            for count in range(2, min(workers, len(parts)) + 1):
+                if max(floor, largest, cost / count) + (count - 1) * overhead >= best_cost:
+                    continue
+                plans = plan_workers(members, parts, count, weights)
+                chunks = [[i for batch in plan for i in batch] for plan in plans]
+                longest = max(math.fsum(weights[i] for i in chunk) for chunk in chunks)
+                projected = max(floor, longest) + (count - 1) * overhead
+                if projected < best_cost:
+                    best, best_cost = chunks, projected
+        result.extend(best)
+    positions = {index: position for position, index in enumerate(indices)}
+    return sorted(result, key=lambda members: positions[members[0]])
+
+
 class WorkScheduler:
     """Rebalance unstarted groups before a worker passes them in collection order.
 

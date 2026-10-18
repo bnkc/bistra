@@ -12,7 +12,7 @@ import pytest
 from .durations import load_history, save_history, update_history
 from .executor import WorkerStop, execute_parallel
 from .protocol import ControlEvent, Emit, Event
-from .scheduling import estimate_durations
+from .scheduling import estimate_durations, refine_fixture_groups
 
 if TYPE_CHECKING:
     from _pytest.capture import CaptureManager
@@ -323,7 +323,7 @@ class PytestAdapter:
 
 
 def _fixture_groups(items: Sequence[pytest.Item]) -> list[list[int]]:
-    """Keep tests that share scoped fixtures together, in collection order.
+    """Find fixture-locality groups, in collection order.
 
     Session fixtures stay local to each worker. Group parameterized session
     fixtures by parameter so scheduling does not repeatedly switch values.
@@ -383,6 +383,19 @@ def _fixture_groups(items: Sequence[pytest.Item]) -> list[list[int]]:
     return list(groups.values())
 
 
+def _explicit_groups(items: Sequence[pytest.Item]) -> list[list[int]]:
+    """Honor xdist's composite group names without changing test identities."""
+    groups: dict[str, list[int]] = {}
+    for index, item in enumerate(items):
+        names = {
+            str(mark.args[0] if mark.args else mark.kwargs.get("name", "default"))
+            for mark in item.iter_markers("xdist_group")
+        }
+        if names:
+            groups.setdefault("_".join(sorted(names)), []).append(index)
+    return list(groups.values())
+
+
 class BistraPlugin:
     def __init__(self, *, workers: int, pool: "WorkerPool | None" = None) -> None:
         self.workers = workers
@@ -393,6 +406,7 @@ class BistraPlugin:
 
     @pytest.hookimpl(tryfirst=True)
     def pytest_configure(self, config):
+        config.addinivalue_line("markers", "xdist_group(name): keep tests with the same group on one worker")
         if (
             getattr(config.option, "numprocesses", None) not in (None, 0)
             or getattr(config.option, "dist", "no") != "no"
@@ -491,13 +505,19 @@ class BistraPlugin:
         history = load_history(cache_path)
         indices = list(range(len(nodeids)))
         estimates = {index: history[nodeid]["total"] for index, nodeid in enumerate(nodeids) if nodeid in history}
-        groups = self.collection.groups
         try:
             estimate_durations(indices, estimates)
         except ValueError:
             # Ignore unusable duration estimates so tests can still run.
             history = {}
             estimates = {}
+        groups = refine_fixture_groups(
+            indices,
+            self.collection.groups,
+            self.collection.required_groups,
+            self.workers,
+            {index: history[nodeid] for index, nodeid in enumerate(nodeids) if nodeid in history},
+        )
         measured: dict[str, dict[str, float]] = {}
         worker_exit: ControlEvent | None = None
 

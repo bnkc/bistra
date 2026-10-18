@@ -74,6 +74,7 @@ def test_original_stdin_is_usable_without_bypassing_pytest_capture(tmp_path, sub
     [
         "nodeids",
         "fixtures",
+        "explicit-groups",
         "collection-error",
         "import-error",
         "crash",
@@ -119,6 +120,12 @@ def test_collection_problems_run_no_tests_and_reap_workers(tmp_path, subprocess_
     conftest += f"\n@pytest.fixture(scope={scope})\ndef resource():\n    return 1\n"
     if problem == "nodeids":
         conftest += "\ndef pytest_collection_modifyitems(items):\n    items[0]._nodeid += str(os.getpid())\n"
+    elif problem == "explicit-groups":
+        conftest += (
+            "\ndef pytest_collection_modifyitems(items):\n"
+            '    if os.environ.get("PYTEST_XDIST_WORKER") == "bistra0":\n'
+            '        for item in items:\n            item.add_marker(pytest.mark.xdist_group("shared"))\n'
+        )
     elif problem == "collection-error":
         conftest += (
             "\ndef pytest_collection_modifyitems(items):\n    if CHILD:\n"
@@ -158,6 +165,7 @@ def test_collection_problems_run_no_tests_and_reap_workers(tmp_path, subprocess_
     expected = {
         "nodeids": "collection differs",
         "fixtures": "collection differs",
+        "explicit-groups": "collection differs",
         "collection-error": "child collection evidence",
         "import-error": "child import evidence",
         "crash": "17",

@@ -1,4 +1,6 @@
-# <img src=".github/assets/bistra.svg" alt="" width="96" height="57"> Bistra
+<p align="center">
+  <img src=".github/assets/bistra.svg" alt="Bistra" width="100%">
+</p>
 
 > **Pre-alpha.** Bistra is a work in progress. Expect bugs, missing features, and
 > breaking changes. It's ready to experiment with, but not to rely on yet.

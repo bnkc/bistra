@@ -98,7 +98,7 @@ deps = [
         "pytest==8.4.2",
     ], extend = true },
 ]
-commands = [["python", "-m", "pytest", { replace = "posargs", extend = true }]]
+commands = [["python", "-m", "bistra", { replace = "posargs", extend = true }]]
 
 [tool.tox.env.lint]
 description = "Check lint rules and formatting"

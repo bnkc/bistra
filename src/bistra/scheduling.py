@@ -216,42 +216,49 @@ class WorkScheduler:
             return
         self.last_balance[worker] = now
         remaining = [self._remaining(slot, now) for slot in range(len(self.queues))]
-        donor = max(range(len(self.queues)), key=lambda slot: remaining[slot])
-        gap = remaining[donor] - remaining[worker]
-        if gap < max(0.1, remaining[worker] * 0.2):
+        # The busiest worker may have no transferable groups. Try other donors
+        # before giving up, keeping the same ownership and ordering constraints.
+        for donor in sorted(range(len(self.queues)), key=lambda slot: -remaining[slot]):
+            gap = remaining[donor] - remaining[worker]
+            if gap < max(0.1, remaining[worker] * 0.2):
+                return
+            eligible = {
+                self.group_for[batch[0]]
+                for batch in self.queues[donor]
+                if self.group_for[batch[0]] not in self.locked
+                and self.positions[self.groups[self.group_for[batch[0]]][0]] > self.bounds[worker]
+            }
+            selected: set[int] = set()
+            cost = 0.0
+            for group in sorted(
+                eligible, key=lambda group: (-self.costs[group], self.positions[self.groups[group][0]])
+            ):
+                weight = self.costs[group]
+                if weight > 0 and cost + weight <= gap / 2:
+                    selected.add(group)
+                    cost += weight
+            if cost < 0.01:
+                continue
+            moved: list[int] = []
+            retained: deque[list[int]] = deque()
+            for batch in self.queues[donor]:
+                if self.group_for[batch[0]] in selected:
+                    moved.extend(batch)
+                else:
+                    retained.append(batch)
+            self.queues[donor] = retained
+            indices = sorted(
+                [*moved, *(i for batch in self.queues[worker] for i in batch)], key=self.positions.__getitem__
+            )
+            merged: deque[list[int]] = deque()
+            previous = None
+            for index in indices:
+                group = self.group_for[index]
+                if previous != group:
+                    merged.append([])
+                    previous = group
+                merged[-1].append(index)
+            self.queues[worker] = merged
+            self.queued[donor] -= cost
+            self.queued[worker] += cost
             return
-        eligible = {
-            self.group_for[batch[0]]
-            for batch in self.queues[donor]
-            if self.group_for[batch[0]] not in self.locked
-            and self.positions[self.groups[self.group_for[batch[0]]][0]] > self.bounds[worker]
-        }
-        selected: set[int] = set()
-        cost = 0.0
-        for group in sorted(eligible, key=lambda group: (-self.costs[group], self.positions[self.groups[group][0]])):
-            weight = self.costs[group]
-            if weight > 0 and cost + weight <= gap / 2:
-                selected.add(group)
-                cost += weight
-        if cost < 0.01:
-            return
-        moved: list[int] = []
-        retained: deque[list[int]] = deque()
-        for batch in self.queues[donor]:
-            if self.group_for[batch[0]] in selected:
-                moved.extend(batch)
-            else:
-                retained.append(batch)
-        self.queues[donor] = retained
-        indices = sorted([*moved, *(i for batch in self.queues[worker] for i in batch)], key=self.positions.__getitem__)
-        merged: deque[list[int]] = deque()
-        previous = None
-        for index in indices:
-            group = self.group_for[index]
-            if previous != group:
-                merged.append([])
-                previous = group
-            merged[-1].append(index)
-        self.queues[worker] = merged
-        self.queued[donor] -= cost
-        self.queued[worker] += cost

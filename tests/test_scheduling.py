@@ -194,3 +194,30 @@ def test_adaptive_dispatch_preserves_inventory_affinity_and_order_with_inaccurat
     assert all(sequence == sorted(sequence, key=positions.__getitem__) for sequence in seen)
     for group in groups:
         assert any(set(group) <= set(sequence) for sequence in seen)
+
+
+def test_rebalance_tries_another_donor_without_moving_locked_or_earlier_work():
+    indices = [90, 80, 70, 50, 65, 60, 40, 30, 20, 10]
+    groups = [[90], [80, 30], [70], [50, 10], [65], [60], [40, 20]]
+    plans = [[[90], [60]], [[80], [30]], [[70], [50], [65], [40, 20], [10]]]
+    weights = {**dict.fromkeys(indices, 1), 80: 100, 70: 10, 40: 2, 20: 2}
+    scheduler = WorkScheduler(indices, groups, plans, weights)
+    seen = [scheduler.take(worker, 0, rebalance=False) for worker in range(3)]
+    seen[0].extend(scheduler.take(0, 0, rebalance=False))
+    seen[2].extend(scheduler.take(2, 0, rebalance=False))
+    scheduler.completed(0, 90)
+
+    # The busiest donor's queued 30 belongs to its started 80 group. The next
+    # donor can give 40/20, but 65 precedes our lookahead and 10 is reserved with 50.
+    batch = scheduler.take(0, 0.1)
+    assert batch == [40, 20]
+    seen[0].extend(batch)
+    for worker in range(3):
+        while batch := scheduler.take(worker, 0.1, rebalance=False):
+            seen[worker].extend(batch)
+    assert seen == [[90, 60, 40, 20], [80, 30], [70, 50, 65, 10]]
+    assert sorted(index for sequence in seen for index in sequence) == sorted(indices)
+    positions = {index: rank for rank, index in enumerate(indices)}
+    assert all(sequence == sorted(sequence, key=positions.__getitem__) for sequence in seen)
+    for group in groups:
+        assert any(set(group) <= set(sequence) for sequence in seen)

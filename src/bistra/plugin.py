@@ -18,7 +18,7 @@ def pytest_addoption(parser):
         "--bistra-workers",
         type=parse_worker_count,
         default=DEFAULT_WORKERS,
-        help=(f"worker processes (default: {DEFAULT_WORKERS}; 1 runs serially)"),
+        help=f"worker processes: auto or a positive integer (default: {DEFAULT_WORKERS}; 1 runs serially)",
     )
 
 

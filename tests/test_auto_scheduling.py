@@ -1,4 +1,3 @@
-import hashlib
 import json
 import os
 import subprocess
@@ -8,14 +7,13 @@ from collections import Counter
 
 import pytest
 
-from bistra.durations import load_history, save_history
+from bistra.durations import history_path, load_history, save_history
 
 pytestmark = pytest.mark.skipif(os.name != "posix", reason="parallel workers require POSIX")
 
 
 def _history_path(tmp_path):
-    key = hashlib.sha256((str(tmp_path) + sys.version).encode()).hexdigest()[:24]
-    return tmp_path / "cache" / "bistra" / f"{key}.json"
+    return history_path(tmp_path)
 
 
 def _run(tmp_path, subprocess_env, *, run="run", workers=2):

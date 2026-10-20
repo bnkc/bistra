@@ -1,5 +1,3 @@
-import hashlib
-import os
 import signal
 import sys
 import warnings
@@ -9,7 +7,7 @@ from typing import TYPE_CHECKING, Any, Literal, NoReturn, cast
 
 import pytest
 
-from .durations import load_history, save_history, update_history
+from .durations import history_path, load_history, save_history, update_history
 from .executor import WorkerStop, execute_parallel
 from .protocol import ControlEvent, Emit, Event
 from .scheduling import estimate_durations, refine_fixture_groups
@@ -403,6 +401,9 @@ class BistraPlugin:
         self.collection: Collection | None = None
         self.collection_reporter: _CollectionReporter | None = None
         self.phase_durations: dict[str, dict[str, float]] = {}
+        self.timing_path: Path | None = None
+        self.history: dict[str, dict[str, float]] = {}
+        self.measured: dict[str, dict[str, float]] = {}
 
     @pytest.hookimpl(tryfirst=True)
     def pytest_configure(self, config):
@@ -439,13 +440,25 @@ class BistraPlugin:
         return result
 
     @pytest.hookimpl(wrapper=True, tryfirst=True)
-    def pytest_sessionfinish(self):
+    def pytest_sessionfinish(self, session):
         # Resource teardown must happen while controller session resources are
         # still alive, including on collection failure or interruption.
         try:
             if self.pool is not None:
                 self.pool.close()
         finally:
+            if self.timing_path is not None:
+                if self.workers == 1:
+                    self.measured = {
+                        nodeid: {"total": sum(phases.values()), **phases}
+                        for nodeid, phases in self.phase_durations.items()
+                    }
+                try:
+                    save_history(self.timing_path, update_history(self.history, self.measured))
+                except OSError:
+                    terminal = session.config.pluginmanager.get_plugin("terminalreporter")
+                    if terminal:
+                        terminal.write_line("bistra: could not save test timings", yellow=True)
             result = yield
         return result
 
@@ -462,9 +475,6 @@ class BistraPlugin:
         if terminal and self.collection.deselected:
             terminal.write_line(f"bistra: {self.collection.deselected} deselected")
         return True
-
-    def pytest_report_header(self):
-        return f"bistra: fresh interpreters, {self.workers} execution slots"
 
     def pytest_runtest_logreport(self, report: pytest.TestReport) -> None:
         if report.when in ("setup", "call", "teardown"):
@@ -489,28 +499,37 @@ class BistraPlugin:
             if not config.option.continue_on_collection_errors:
                 return None
         if self.workers == 1:
-            return None
-        assert self.collection is not None
-        nodeids = self.collection.nodeids
+            nodeids = [item.nodeid for item in session.items]
+        else:
+            assert self.collection is not None
+            nodeids = self.collection.nodeids
         if not nodeids:
             return True
         terminal = cast("TerminalReporter | None", config.pluginmanager.get_plugin("terminalreporter"))
         capman = cast("CaptureManager | None", config.pluginmanager.get_plugin("capturemanager"))
-        if capman:
+        if capman and self.workers > 1:
             capman.suspend_global_capture()
-        base = config._tmp_path_factory.getbasetemp() / "bistra-workers"  # ty: ignore[unresolved-attribute]
-        base.mkdir(exist_ok=True)
-        key = hashlib.sha256((str(config.rootpath) + sys.version).encode()).hexdigest()[:24]
-        cache_path = Path(os.environ.get("XDG_CACHE_HOME", str(Path.home() / ".cache"))) / "bistra" / f"{key}.json"
-        history = load_history(cache_path)
+        self.timing_path = history_path(config.rootpath)
+        history = self.history = load_history(self.timing_path)
         indices = list(range(len(nodeids)))
         estimates = {index: history[nodeid]["total"] for index, nodeid in enumerate(nodeids) if nodeid in history}
         try:
             estimate_durations(indices, estimates)
         except ValueError:
             # Ignore unusable duration estimates so tests can still run.
-            history = {}
+            history = self.history = {}
             estimates = {}
+        if terminal and config.option.verbose >= 0:
+            test_label = "test" if len(indices) == 1 else "tests"
+            worker_label = "worker" if self.workers == 1 else "workers"
+            terminal.write_line(f"Running {len(indices):,} {test_label} with {self.workers} {worker_label}")
+            if not estimates:
+                terminal.write_line("Profiling tests")
+        if self.workers == 1:
+            return None
+        base = config._tmp_path_factory.getbasetemp() / "bistra-workers"  # ty: ignore[unresolved-attribute]
+        base.mkdir(exist_ok=True)
+        assert self.collection is not None
         groups = refine_fixture_groups(
             indices,
             self.collection.groups,
@@ -518,13 +537,12 @@ class BistraPlugin:
             self.workers,
             {index: history[nodeid] for index, nodeid in enumerate(nodeids) if nodeid in history},
         )
-        measured: dict[str, dict[str, float]] = {}
         worker_exit: ControlEvent | None = None
 
         def completed(index: int, elapsed: float) -> None:
             nodeid = nodeids[index]
             phases = self.phase_durations.pop(nodeid, {})
-            measured[nodeid] = {
+            self.measured[nodeid] = {
                 "total": elapsed,
                 **{phase: phases.get(phase, 0.0) for phase in ("setup", "call", "teardown")},
             }
@@ -567,14 +585,6 @@ class BistraPlugin:
 
         assert self.pool is not None, "Parallel execution requires collected workers."
         self.pool.base = base
-        if terminal:
-            terminal.write_line(
-                f"bistra: dispatching {len(indices)} tests across {self.workers} fresh worker processes"
-            )
-            if estimates:
-                terminal.write_line(f"bistra: using duration history for {len(estimates)}/{len(indices)} tests")
-            else:
-                terminal.write_line("bistra: learning test durations")
         result = execute_parallel(
             indices,
             workers=self.workers,
@@ -584,11 +594,6 @@ class BistraPlugin:
             estimates=estimates,
             start_worker=self.pool.start_worker,
         )
-        try:
-            save_history(cache_path, update_history(history, measured))
-        except OSError:
-            if terminal:
-                terminal.write_line("bistra: could not save optional duration cache", yellow=True)
         if result.crashes:
             for crash in result.crashes:
                 if terminal:

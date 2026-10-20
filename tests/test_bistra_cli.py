@@ -8,6 +8,7 @@ from pathlib import Path
 
 import pytest
 
+from bistra import options
 from bistra.cli import main
 
 
@@ -44,19 +45,23 @@ def test_cli_forwards_pytest_arguments(monkeypatch):
 
 
 @pytest.mark.parametrize("arguments", [["-j", "0"], ["--workers", "-1"], ["-j", "many"]])
-def test_cli_rejects_invalid_counts(arguments):
+def test_cli_rejects_invalid_counts(arguments, monkeypatch, capsys):
+    monkeypatch.delenv("NO_COLOR", raising=False)
+    monkeypatch.setenv("FORCE_COLOR", "1")
     with pytest.raises(SystemExit) as error:
         main(arguments)
     assert error.value.code == 2
+    assert "\x1b[" not in capsys.readouterr().err
 
 
-def test_cli_version(capsys):
+@pytest.mark.parametrize("flag", ["--version", "-V"])
+def test_cli_version(capsys, flag):
     from bistra import __version__
 
     installed_version = version("bistra")
     assert __version__ == installed_version
     with pytest.raises(SystemExit) as error:
-        main(["--version"])
+        main([flag])
     assert error.value.code == 0
     assert capsys.readouterr().out == f"bistra {installed_version}\n"
 
@@ -150,8 +155,8 @@ def test_execution(index, value, request):
 
 
 def test_installation_does_not_enable_runner(tmp_path, subprocess_env):
-    process = _run(tmp_path, subprocess_env, ["pytest", "-q"], autoload=True)
-    assert "bistra: dispatching" not in process.stdout
+    _run(tmp_path, subprocess_env, ["pytest", "-q"], autoload=True)
+    assert not (tmp_path / ".bistra_cache").exists()
 
 
 @pytest.mark.skipif(os.name != "posix", reason="parallel workers require POSIX")
@@ -208,3 +213,82 @@ def test_pytest_rejects_invalid_worker_count(tmp_path, subprocess_env, count):
     )
     assert process.returncode == 4
     assert "must be a positive integer" in process.stderr
+
+
+def test_short_help_is_concise(capsys, monkeypatch):
+    monkeypatch.delenv("NO_COLOR", raising=False)
+    monkeypatch.setenv("FORCE_COLOR", "1")
+    with pytest.raises(SystemExit) as error:
+        main(["--help"])
+    assert error.value.code == 0
+    output = capsys.readouterr().out
+    assert "\x1b[" not in output
+    assert output.startswith("Run your pytest suite with automatic parallel scheduling.\n\nUsage:")
+    assert "-j, --workers <COUNT>" in output
+    assert "[default: auto]" in output
+    assert "Examples:" not in output
+    assert "Use `bistra -- --help` for all pytest options." in output
+
+
+def test_help_after_separator_reaches_pytest(monkeypatch):
+    calls = []
+    monkeypatch.setattr(pytest, "main", lambda args: calls.append(args) or 0)
+    assert main(["--", "--help"]) == 0
+    assert calls == [["-p", "bistra", "--bistra", "--help"]]
+
+
+def test_normal_pytest_arguments_need_no_separator(monkeypatch):
+    calls = []
+    monkeypatch.setattr(pytest, "main", lambda args: calls.append(args) or 0)
+    assert main(["tests/unit", "-k", "login", "-x"]) == 0
+    assert calls == [["-p", "bistra", "--bistra", "tests/unit", "-k", "login", "-x"]]
+
+
+@pytest.mark.parametrize(
+    "process,affinity,cpu,expected", [(3, {0, 1}, 16, 3), (None, {0, 1}, 16, 2), (None, set(), None, 1)]
+)
+def test_auto_uses_available_cpus(monkeypatch, process, affinity, cpu, expected):
+    monkeypatch.setattr(os, "process_cpu_count", lambda: process, raising=False)
+    monkeypatch.setattr(os, "sched_getaffinity", lambda pid: affinity, raising=False)
+    monkeypatch.setattr(os, "cpu_count", lambda: cpu)
+    assert options.parse_worker_count("auto") == expected
+    assert options.parse_worker_count("8") == 8
+
+
+@pytest.mark.parametrize("cpu,expected", [(16, 16), (None, 1), (0, 1)])
+def test_auto_falls_back_on_older_python(monkeypatch, cpu, expected):
+    monkeypatch.delattr(os, "process_cpu_count", raising=False)
+
+    def unavailable(pid):
+        raise OSError("affinity unavailable")
+
+    monkeypatch.setattr(os, "sched_getaffinity", unavailable, raising=False)
+    monkeypatch.setattr(os, "cpu_count", lambda: cpu)
+    assert options.available_workers() == expected
+
+
+@pytest.mark.parametrize(
+    "arguments,expected", [([], None), (["--bistra-workers=auto"], None), (["--bistra-workers=3"], 3)]
+)
+def test_pytest_resolves_default_and_explicit_workers(tmp_path, subprocess_env, arguments, expected):
+    (tmp_path / "pytest.ini").write_text("[pytest]\n")
+    (tmp_path / "conftest.py").write_text("""
+from pathlib import Path
+from bistra.options import available_workers
+
+def pytest_configure(config):
+    count = config.getoption("bistra_workers")
+    assert isinstance(count, int)
+    Path("workers.txt").write_text(f"{count},{available_workers()}")
+""")
+    result = subprocess.run(
+        [sys.executable, "-m", "pytest", "-p", "bistra", "--bistra", "--collect-only", *arguments],
+        cwd=tmp_path,
+        env=subprocess_env,
+        text=True,
+        capture_output=True,
+        timeout=15,
+    )
+    assert result.returncode == 5, result.stdout + result.stderr
+    count, available = map(int, (tmp_path / "workers.txt").read_text().split(","))
+    assert count == (available if expected is None else expected)

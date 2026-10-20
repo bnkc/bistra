@@ -41,8 +41,12 @@ The controller runs project setup before starting workers. Existing
 available until workers finish. This supports local resource hooks, not xdist
 gateways or custom xdist schedulers.
 
-Don't combine Bistra with xdist worker options. Compatibility with coverage,
-Testmon, and other plugins that control test execution hasn't been verified yet.
+With pytest-cov installed, use its normal options, for example
+`bistra --cov=my_package --cov-report=xml`. Bistra combines worker coverage before
+generating reports and checking coverage thresholds. Versions 5–7 are tested.
+
+Don't combine Bistra with xdist worker options. Compatibility with Testmon and
+other plugins that control test execution hasn't been verified yet.
 
 ## Contributing
 

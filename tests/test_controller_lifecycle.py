@@ -9,6 +9,59 @@ import textwrap
 import pytest
 
 
+@pytest.mark.parametrize("tests", [0, 1, 4])
+def test_worker_loop_and_session_hooks_finish_before_controller_reporting(tmp_path, subprocess_env, tests):
+    (tmp_path / "pytest.ini").write_text("[pytest]\n")
+    (tmp_path / "conftest.py").write_text(
+        textwrap.dedent("""
+        import json
+        from pathlib import Path
+        import pytest
+
+        @pytest.hookimpl(wrapper=True)
+        def pytest_runtestloop(session):
+            result = yield
+            if hasattr(session.config, "workerinput"):
+                session.config.workeroutput["loop"] = True
+            else:
+                assert len(list(Path(".").glob("finished-*.json"))) == 2
+            return result
+
+        def pytest_sessionfinish(session):
+            if hasattr(session.config, "workerinput"):
+                output = session.config.workeroutput
+                assert output == {"loop": True}
+                output["session"] = True
+
+        def pytest_unconfigure(config):
+            if hasattr(config, "workerinput"):
+                output = config.workeroutput
+                assert output == {"loop": True, "session": True}
+                output["unconfigure"] = True
+
+        def pytest_testnodedown(node, error):
+            assert error is None
+            Path("finished-" + node.gateway.id + ".json").write_text(json.dumps(node.workeroutput))
+    """)
+    )
+    (tmp_path / "test_cases.py").write_text(
+        "\n".join(f"def test_case_{index}():\n    pass\n" for index in range(tests))
+    )
+    result = subprocess.run(
+        [sys.executable, "-m", "bistra", "-j", "2", "-q"],
+        cwd=tmp_path,
+        env=subprocess_env,
+        text=True,
+        capture_output=True,
+        timeout=20,
+    )
+    assert result.returncode == (0 if tests else 5), result.stdout + result.stderr
+    assert [json.loads(path.read_text()) for path in sorted(tmp_path.glob("finished-*.json"))] == [
+        {"loop": True, "session": True, "unconfigure": True},
+        {"loop": True, "session": True, "unconfigure": True},
+    ]
+
+
 def test_embedded_entry_point_imports_follow_controller_setup(tmp_path, subprocess_env):
     """Spawn reimports the caller before entering Bistra's worker function."""
     (tmp_path / "pytest.ini").write_text("[pytest]\n")

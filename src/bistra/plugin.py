@@ -24,10 +24,12 @@ def pytest_addoption(parser):
 
 @pytest.hookimpl(wrapper=True, tryfirst=True)
 def pytest_load_initial_conftests(early_config, parser, args):
+    from .coverage import distributed_coverage
     from .fresh import start_collection
 
     start_collection(early_config)
-    return (yield)
+    with distributed_coverage(early_config):
+        return (yield)
 
 
 @pytest.fixture(scope="session")

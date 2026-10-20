@@ -9,6 +9,7 @@ import signal
 import sys
 import tempfile
 import time
+import traceback
 from dataclasses import dataclass
 from multiprocessing.connection import Connection, wait
 from multiprocessing.process import BaseProcess
@@ -18,9 +19,9 @@ from typing import TYPE_CHECKING, Any, NoReturn, cast
 
 import pytest
 
-from .executor import _signal_group, _worker
+from .executor import _exit_worker, _run_worker, _signal_group, _worker_error
 from .lifecycle import WorkerNode
-from .protocol import Event
+from .protocol import Event, WorkerResult
 from .transport import FramedReceiver, TransportError
 
 if TYPE_CHECKING:
@@ -40,6 +41,7 @@ class ChildContext:
     original_streams: list[int]
     worker_output: dict[str, Any]
     collection_events: list[Event]
+    result: WorkerResult | None = None
 
 
 child_context: ChildContext | None = None
@@ -79,7 +81,22 @@ def _main(
     worker_output: dict[str, Any] = {}
     child_context = ChildContext(connection, worker_id, worker_input, original_streams, worker_output, [])
     try:
-        status = pytest.main(args, plugins=plugins)
+        try:
+            status = pytest.main(args, plugins=plugins)
+        except BaseException:
+            if child_context.result is None:
+                raise
+            child_context.result = _worker_error(child_context.result, traceback.format_exc())
+            status = pytest.ExitCode.INTERNAL_ERROR
+        if child_context.result is not None:
+            result = child_context.result
+            events = result[1] if result[0] == "finished" else result[1].setdefault("events", [])
+            events.append({"type": "workeroutput", "worker_id": worker_id, "data": worker_output})
+            if status not in (pytest.ExitCode.OK, pytest.ExitCode.TESTS_FAILED):
+                result = _worker_error(result, f"pytest worker cleanup failed (exit {int(status)})")
+            # Pytest's runtestloop wrappers, sessionfinish and unconfigure have
+            # all completed, including plugins that publish workeroutput there.
+            _exit_worker(connection, result)
         sys.stdout.flush()
         sys.stderr.flush()
         connection.send(("collection_error", int(status), worker_output, child_context.collection_events))
@@ -121,8 +138,8 @@ def run_child(session: pytest.Session, owner: "BistraPlugin") -> bool:
         os.dup2(original, fd)
         os.close(original)
     adapter = PytestAdapter(session, owner, Path(job["base"]))
-    _worker(connection, worker_id, adapter, job["initial"])
-    raise AssertionError("Worker loop must terminate its interpreter.")
+    child_context.result = _run_worker(connection, worker_id, adapter, job["initial"])
+    return True
 
 
 @dataclass

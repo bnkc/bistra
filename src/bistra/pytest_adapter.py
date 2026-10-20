@@ -312,12 +312,9 @@ class PytestAdapter:
             raise WorkerStop(reason, completed=True)
 
     def finalize(self, emit: Emit) -> None:
+        # Keep collecting teardown reports while pytest.main unwinds normally.
+        # fresh._main publishes workeroutput after all session hooks complete.
         self.reporter.emit = emit
-        status = pytest.ExitCode.TESTS_FAILED if self.session.testsfailed else pytest.ExitCode.OK
-        self.config.hook.pytest_sessionfinish(session=self.session, exitstatus=status)
-        output = self.config.workeroutput  # ty: ignore[unresolved-attribute]
-        self.config._ensure_unconfigure()
-        emit({"type": "workeroutput", "data": output})
 
 
 def _fixture_groups(items: Sequence[pytest.Item]) -> list[list[int]]:
@@ -504,6 +501,8 @@ class BistraPlugin:
             assert self.collection is not None
             nodeids = self.collection.nodeids
         if not nodeids:
+            if self.pool is not None:
+                self.pool.close()
             return True
         terminal = cast("TerminalReporter | None", config.pluginmanager.get_plugin("terminalreporter"))
         capman = cast("CaptureManager | None", config.pluginmanager.get_plugin("capturemanager"))
@@ -585,15 +584,20 @@ class BistraPlugin:
 
         assert self.pool is not None, "Parallel execution requires collected workers."
         self.pool.base = base
-        result = execute_parallel(
-            indices,
-            workers=self.workers,
-            on_event=event,
-            on_complete=completed,
-            groups=groups,
-            estimates=estimates,
-            start_worker=self.pool.start_worker,
-        )
+        try:
+            result = execute_parallel(
+                indices,
+                workers=self.workers,
+                on_event=event,
+                on_complete=completed,
+                groups=groups,
+                estimates=estimates,
+                start_worker=self.pool.start_worker,
+            )
+        finally:
+            # Distributed reporters need workeroutput before their runtestloop
+            # wrappers combine data and enforce thresholds.
+            self.pool.close()
         if result.crashes:
             for crash in result.crashes:
                 if terminal:

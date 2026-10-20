@@ -17,9 +17,9 @@ from dataclasses import dataclass, field
 from multiprocessing.connection import Connection, wait
 from multiprocessing.process import BaseProcess
 from queue import Empty, SimpleQueue
-from typing import Literal, cast
+from typing import Literal, NoReturn, cast
 
-from .protocol import Event, OnEvent, StartWorker, WorkerAdapter, WorkerFailure, WorkerMessage
+from .protocol import Event, OnEvent, StartWorker, WorkerAdapter, WorkerFailure, WorkerMessage, WorkerResult
 from .scheduling import WorkScheduler, plan_workers
 from .transport import FramedReceiver, TransportError
 
@@ -109,7 +109,8 @@ def _message_parts(message: object) -> WorkerMessage:
     return cast(WorkerMessage, message)
 
 
-def _worker(connection: Connection, worker_id: int, adapter: WorkerAdapter, initial: list[int]) -> None:
+def _run_worker(connection: Connection, worker_id: int, adapter: WorkerAdapter, initial: list[int]) -> WorkerResult:
+    """Run assignments, leaving final publication to the interpreter's owner."""
     pending: deque[int] = deque(initial)
     final = False
     index: int | None = None
@@ -129,9 +130,7 @@ def _worker(connection: Connection, worker_id: int, adapter: WorkerAdapter, init
         else:
             pending.extend(batch)
 
-    failed = False
     initialized = False
-    cleanup_attempted = False
     try:
         # A separate process group lets the parent clean up worker subprocesses.
         if os.getsid(0) != os.getpid():
@@ -152,10 +151,7 @@ def _worker(connection: Connection, worker_id: int, adapter: WorkerAdapter, init
         if initialized:
             initialized = False
             adapter.finalize(emit)
-        # Flush uncaptured output before exiting.
-        cleanup_attempted = True
-        _finish_worker()
-        connection.send(("finished", events))
+        return ("finished", events)
     except BaseException as error:
         controlled = isinstance(error, WorkerStop)
         failed = not controlled
@@ -170,31 +166,36 @@ def _worker(connection: Connection, worker_id: int, adapter: WorkerAdapter, init
             except BaseException:
                 failed = True
                 detail += "\nDuring worker cleanup:\n" + traceback.format_exc()
-        if not cleanup_attempted:
-            try:
-                _finish_worker()
-            except BaseException:
-                failed = True
-                detail += "\nFinalizing worker resources:\n" + traceback.format_exc()
+        return (
+            "crash" if failed else "stopped",
+            {"worker_id": worker_id, "index": index, "traceback": detail, "events": events},
+        )
+
+
+def _worker_error(result: WorkerResult, detail: str) -> WorkerResult:
+    if result[0] == "finished":
+        return ("crash", {"index": None, "traceback": detail, "events": result[1]})
+    result[1]["traceback"] += "\n" + detail
+    return ("crash", result[1])
+
+
+def _exit_worker(connection: Connection, result: WorkerResult) -> NoReturn:
+    try:
         try:
-            kind = "crash" if failed else "stopped"
-            connection.send(
-                (
-                    kind,
-                    {
-                        "worker_id": worker_id,
-                        "index": index,
-                        "traceback": detail,
-                        "events": events,
-                    },
-                )
-            )
+            _finish_worker()
+        except BaseException:
+            result = _worker_error(result, "Finalizing worker resources:\n" + traceback.format_exc())
+        try:
+            connection.send(result)
         except (OSError, EOFError):
             pass
     finally:
         connection.close()
-        # Avoid running session cleanup again when the outer pytest.main returns.
-        os._exit(1 if failed else 0)
+        os._exit(1 if result[0] == "crash" else 0)
+
+
+def _worker(connection: Connection, worker_id: int, adapter: WorkerAdapter, initial: list[int]) -> None:
+    _exit_worker(connection, _run_worker(connection, worker_id, adapter, initial))
 
 
 def execute_parallel(

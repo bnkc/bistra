@@ -44,6 +44,7 @@ dev = [
     { include-group = "package" },
     "pre-commit>=4.7,<5",
     "pytest==8.4.2",
+    "pytest-cov>=5,<8",
     "tox>=4.65,<5",
 ]
 lint = ["ruff==0.17.1"]
@@ -94,6 +95,7 @@ env_list = [
 description = "Test the installed wheel"
 package = "wheel"
 deps = [
+    "pytest-cov>=5,<8",
     { replace = "if", condition = "factor.pytestmin", then = [
         "pytest==8.4.2",
     ], extend = true },

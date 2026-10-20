@@ -78,10 +78,12 @@ class WorkerFailure(TypedDict):
     events: NotRequired[list[Event]]
 
 
+WorkerResult: TypeAlias = tuple[Literal["finished"], list[Event]] | tuple[Literal["crash", "stopped"], WorkerFailure]
+
+
 WorkerMessage: TypeAlias = (
     tuple[Literal["need"], None]
     | tuple[Literal["started"], int]
     | tuple[Literal["done"], tuple[int, float, list[Event]]]
-    | tuple[Literal["finished"], list[Event]]
-    | tuple[Literal["crash", "stopped"], WorkerFailure]
+    | WorkerResult
 )

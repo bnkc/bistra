@@ -30,6 +30,15 @@ def register_hooks(config: pytest.Config) -> None:
         config.pluginmanager.add_hookspecs(type("BistraLifecycleHooks", (), missing))
 
 
+@dataclass(frozen=True)
+class _LocalGateway:
+    id: str
+
+    def _rinfo(self) -> SimpleNamespace:
+        # pytest-cov uses this xdist interface to label contributing workers.
+        return SimpleNamespace(platform=sys.platform, version_info=tuple(sys.version_info))
+
+
 @dataclass(eq=False)
 class WorkerNode:
     config: pytest.Config
@@ -48,6 +57,12 @@ class WorkerNode:
         }
 
     @property
-    def gateway(self) -> SimpleNamespace:
+    def gateway(self) -> _LocalGateway:
         # Common resource hooks use node.gateway.id to name their resources.
-        return SimpleNamespace(id=self.workerinput["workerid"])
+        return _LocalGateway(self.workerinput["workerid"])
+
+    @property
+    def nodemanager(self) -> SimpleNamespace:
+        # pytest-cov asks for xdist's synchronized roots. Local workers already
+        # share the controller's filesystem, so no roots need synchronization.
+        return SimpleNamespace(roots=())

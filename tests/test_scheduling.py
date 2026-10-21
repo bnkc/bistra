@@ -1,223 +1,151 @@
-import heapq
-import math
-import random
-from collections import deque
-
 import pytest
 
-from bistra.scheduling import WorkScheduler, estimate_durations, plan_workers, refine_fixture_groups
+from bistra.scheduling import Batch, Collection, Scheduler
+from bistra.timings import Timing
 
 
-def test_balances_expensive_tests_without_reversing_execution():
-    groups = [[0], [1], [2], [3]]
-    plans = plan_workers([0, 1, 2, 3], groups, 2, {0: 1, 1: 2, 2: 6, 3: 5})
-    assert plans == [[[0], [2]], [[1], [3]]]
-    assert groups == [[0], [1], [2], [3]]
-
-
-def test_interleaved_affinity_groups_preserve_collection_order_and_batch_boundaries():
-    indices = [7, 4, 9, 2, 6, 1]
-    groups = [[7, 9], [4], [2, 6], [1]]
-    plans = plan_workers(indices, groups, 2, {7: 2, 9: 2, 4: 1, 2: 4, 6: 4, 1: 1})
-    assert plans == [[[2, 6]], [[7], [4], [9], [1]]]
-    owners = {index: worker for worker, batches in enumerate(plans) for batch in batches for index in batch}
-    assert set(owners) == set(indices)
-    for group in groups:
-        assert len({owners[index] for index in group}) == 1
-
-
-def test_unknown_durations_use_selected_positive_mean():
-    durations = {0: "2", 1: 4, 2: 0, 3: -1, 4: math.nan, 5: math.inf, 6: "bad", 7: True, 99: 10000}
-    assert estimate_durations(list(range(9)), durations) == {0: 2, 1: 4, 2: 0, **dict.fromkeys(range(3, 9), 3)}
-    assert estimate_durations([0, 1], {0: 0, 99: 10000}) == {0: 0, 1: 1}
-
-
-@pytest.mark.parametrize("durations", [{}, dict.fromkeys(range(6), 0)])
-def test_cold_and_zero_duration_plans_use_all_workers(durations):
-    plans = plan_workers(list(range(6)), [[i] for i in range(6)], 3, durations)
-    assert plans == [[[0], [3]], [[1], [4]], [[2], [5]]]
-
-
-def test_worker_count_is_bounded_by_affinity_groups():
-    assert plan_workers([0, 1, 2], [[0, 1], [2]], 8, {}) == [[[0, 1]], [[2]]]
-    assert plan_workers([], [], 8, {}) == []
-
-
-def test_unrepresentable_total_is_rejected():
-    with pytest.raises(ValueError, match="too large"):
-        estimate_durations([0, 1], {0: 1e308, 1: 1e308})
-
-
-def test_cheap_fixture_locality_can_use_all_workers():
-    indices = list(range(8))
-    history = {i: {"total": 1, "setup": 0.001, "teardown": 0.001} for i in indices}
-    assert refine_fixture_groups(indices, [indices], [], 8, history) == [[i] for i in indices]
-
-
-@pytest.mark.parametrize("record", [{}, {"total": 1}, {"total": 1, "setup": 0.6, "teardown": 0.3}])
-def test_cold_incomplete_and_expensive_fixture_groups_stay_together(record):
-    indices = list(range(8))
-    assert refine_fixture_groups(indices, [indices], [], 8, dict.fromkeys(indices, record)) == [indices]
-
-
-@pytest.mark.parametrize("missing", [None, -1, float("nan"), float("inf"), True])
-def test_one_unknown_fixture_cost_preserves_the_whole_group(missing):
-    history = {i: {"total": 1, "setup": 0.001, "teardown": 0.001} for i in range(3)}
-    history[1]["setup"] = missing
-    assert refine_fixture_groups([0, 1, 2], [[0, 1, 2]], [], 3, history) == [[0, 1, 2]]
-
-
-def test_replication_cost_limits_useful_parallelism():
-    indices = list(range(8))
-    history = {i: {"total": 1, "setup": 0.1, "teardown": 0} for i in indices}
-    groups = refine_fixture_groups(indices, [indices], [], 8, history)
-    assert groups == [[0, 4], [1, 5], [2, 6], [3, 7]]
-
-
-def test_does_not_replicate_fixtures_when_other_work_already_fills_the_workers():
-    indices = list(range(8))
-    history = {i: {"total": 1, "setup": 0.001, "teardown": 0.001} for i in indices}
-    groups = [[0, 1], [2, 3], [4, 5], [6, 7]]
-    assert refine_fixture_groups(indices, groups, [], 4, history) == groups
-    # A long indivisible test remains the limit even with more workers.
-    history[7]["total"] = 5
-    groups = [[0, 1, 2, 3], [4], [5], [6], [7]]
-    assert refine_fixture_groups(indices, groups, [], 8, history) == groups
-
-
-def test_stops_splitting_once_the_rest_of_the_suite_becomes_the_limit():
-    indices = list(range(12))
-    history = {i: {"total": 1, "setup": 0.001, "teardown": 0.001} for i in indices}
-    groups = [[0, 1, 2, 3, 4, 5], *[[i] for i in range(6, 12)]]
-    refined = refine_fixture_groups(indices, groups, [], 4, history)
-    assert refined == [[0, 2, 4], [1, 3, 5], *[[i] for i in range(6, 12)]]
-
-
-@pytest.mark.parametrize("warm", [False, True])
-def test_explicit_groups_cross_fixture_boundaries_and_preserve_non_numeric_collection_order(warm):
-    indices = [7, 4, 9, 2, 6, 1]
-    history = {i: {"total": 1, "setup": 0, "teardown": 0} for i in indices} if warm else {}
-    groups = refine_fixture_groups(indices, [[7, 9, 6], [4, 2, 1]], [[7, 4], [9, 2]], 8, history)
-    assert sorted(i for group in groups for i in group) == sorted(indices)
-    assert all(group == sorted(group, key=indices.index) for group in groups)
-    owners = {i: owner for owner, group in enumerate(groups) for i in group}
-    assert owners[7] == owners[4]
-    assert owners[9] == owners[2]
-    assert len(groups) == (3 if warm else 1)
-
-
-def test_explicit_group_and_single_worker_cannot_split():
-    indices = list(range(8))
-    history = {i: {"total": 1, "setup": 0, "teardown": 0} for i in indices}
-    assert refine_fixture_groups(indices, [indices], [indices], 8, history) == [indices]
-    assert refine_fixture_groups(indices, [indices], [], 1, history) == [indices]
-    assert refine_fixture_groups([], [], [], 8, {}) == []
-
-
-def test_early_finisher_can_help_before_passing_unstarted_groups():
-    groups = [[0], [1], [2, 4], [3, 5], [6], [7], [8], [9]]
-    plans = [[[0], [2, 4], [6], [8]], [[1], [3, 5], [7], [9]]]
-    scheduler = WorkScheduler(list(range(10)), groups, plans, {**dict.fromkeys(range(10), 1), 0: 8, 1: 8})
-    seen = [[*scheduler.take(0, 0, rebalance=False)], [*scheduler.take(1, 0, rebalance=False)]]
-    scheduler.started(0, 0, 0)
-    scheduler.started(1, 1, 0)
-    scheduler.completed(0, 0)
-    # The first worker finishes much sooner than its history predicted. It can
-    # help now; waiting until its own queue ends would pass all eligible work.
-    batch = scheduler.take(0, 0.1)
-    assert batch == [2]
-    seen[0].extend(batch)
-    for worker in range(2):
-        while batch := scheduler.take(worker, 0.1, rebalance=False):
-            seen[worker].extend(batch)
-    assert 3 in seen[0] and 5 in seen[0]
-    assert sorted(seen[0] + seen[1]) == list(range(10))
-    assert all(items == sorted(items) for items in seen)
-    for group in groups:
-        assert any(set(group) <= set(items) for items in seen)
-
-
-def test_rebalance_keeps_started_affinity_and_reserved_lookahead_in_place():
-    indices = [90, 80, 70, 60, 50, 40, 30, 20]
-    groups = [[90], [80, 40], [70, 50], [60], [30], [20]]
-    plans = [[[90], [70, 50], [30]], [[80], [60], [40], [20]]]
-    scheduler = WorkScheduler(indices, groups, plans, {**dict.fromkeys(indices, 1), 90: 8, 80: 8})
-    assert scheduler.take(0, 0, rebalance=False) == [90]
-    assert scheduler.take(1, 0, rebalance=False) == [80]
-    # Reserving lookahead advances the boundary even before it executes.
-    assert scheduler.take(0, 0, rebalance=False) == [70, 50]
-    scheduler.started(0, 90, 0)
-    scheduler.started(1, 80, 0)
-    scheduler.completed(0, 90)
-    received = []
-    while batch := scheduler.take(0, 0.1):
-        received.extend(batch)
-    assert received == [30, 20]
-    # 60 is before the promised next item; 40 belongs to the group that started
-    # with 80. Neither is eligible even though moving either would reduce load.
-    donor = []
-    while batch := scheduler.take(1, 0.1, rebalance=False):
-        donor.extend(batch)
-    assert donor == [60, 40]
-
-
-@pytest.mark.parametrize("seed", range(20))
-def test_adaptive_dispatch_preserves_inventory_affinity_and_order_with_inaccurate_history(seed):
-    randomizer = random.Random(seed)
-    indices = randomizer.sample(range(1000), 120)
-    positions = {index: rank for rank, index in enumerate(indices)}
-    groups = [indices[offset::30] for offset in range(30)]
-    estimates = {index: randomizer.uniform(0.01, 5) for index in indices}
-    actual = {index: randomizer.uniform(0.01, 5) for index in indices}
-    plans = plan_workers(indices, groups, 4, estimates)
-    scheduler = WorkScheduler(indices, groups, plans, estimates)
-    pending = [deque(scheduler.take(worker, 0, rebalance=False)) for worker in range(4)]
-    seen = [[] for _ in pending]
-    events = []
-
-    def dispatch(worker, now):
-        if len(pending[worker]) == 1:
-            pending[worker].extend(scheduler.take(worker, now) or [])
-        if pending[worker]:
-            index = pending[worker].popleft()
-            seen[worker].append(index)
-            scheduler.started(worker, index, now)
-            heapq.heappush(events, (now + actual[index], worker, index))
-
-    for worker in range(4):
-        dispatch(worker, 0)
-    while events:
-        now, worker, index = heapq.heappop(events)
+def finish(scheduler: Scheduler, worker: int, batch: Batch, now: float) -> None:
+    for index in batch:
+        scheduler.started(worker, index, now=now)
         scheduler.completed(worker, index)
-        dispatch(worker, now)
-    assert sorted(index for sequence in seen for index in sequence) == sorted(indices)
-    assert all(sequence == sorted(sequence, key=positions.__getitem__) for sequence in seen)
-    for group in groups:
-        assert any(set(group) <= set(sequence) for sequence in seen)
 
 
-def test_rebalance_tries_another_donor_without_moving_locked_or_earlier_work():
-    indices = [90, 80, 70, 50, 65, 60, 40, 30, 20, 10]
-    groups = [[90], [80, 30], [70], [50, 10], [65], [60], [40, 20]]
-    plans = [[[90], [60]], [[80], [30]], [[70], [50], [65], [40, 20], [10]]]
-    weights = {**dict.fromkeys(indices, 1), 80: 100, 70: 10, 40: 2, 20: 2}
-    scheduler = WorkScheduler(indices, groups, plans, weights)
-    seen = [scheduler.take(worker, 0, rebalance=False) for worker in range(3)]
-    seen[0].extend(scheduler.take(0, 0, rebalance=False))
-    seen[2].extend(scheduler.take(2, 0, rebalance=False))
-    scheduler.completed(0, 90)
+def drain(scheduler: Scheduler, workers: int) -> list[list[int]]:
+    count = sum(len(scheduler.unfinished(worker)) for worker in range(workers))
+    executed: list[list[int]] = [[] for _ in range(workers)]
+    for step in range(count + 1):
+        progress = False
+        for worker in range(workers):
+            batch = scheduler.dispatch(worker, now=float(step))
+            if batch is not None:
+                progress = True
+                finish(scheduler, worker, batch, float(step))
+                executed[worker].extend(batch)
+        if not progress:
+            return executed
+    raise AssertionError("scheduler did not finish")
 
-    # The busiest donor's queued 30 belongs to its started 80 group. The next
-    # donor can give 40/20, but 65 precedes our lookahead and 10 is reserved with 50.
-    batch = scheduler.take(0, 0.1)
-    assert batch == [40, 20]
-    seen[0].extend(batch)
-    for worker in range(3):
-        while batch := scheduler.take(worker, 0.1, rebalance=False):
-            seen[worker].extend(batch)
-    assert seen == [[90, 60, 40, 20], [80, 30], [70, 50, 65, 10]]
-    assert sorted(index for sequence in seen for index in sequence) == sorted(indices)
-    positions = {index: rank for rank, index in enumerate(indices)}
-    assert all(sequence == sorted(sequence, key=positions.__getitem__) for sequence in seen)
-    for group in groups:
-        assert any(set(group) <= set(sequence) for sequence in seen)
+
+@pytest.mark.parametrize("duration", [None, 0.0, 1e308], ids=["cold", "zero-duration", "overflowing-history"])
+def test_required_groups_stay_together_without_losing_order_or_tests(duration: float | None) -> None:
+    collection = Collection(
+        nodeids=tuple(f"test_{index}" for index in range(12)),
+        required_groups=((0, 4), (4, 8), (1, 5, 9)),
+        fixture_groups=(),
+    )
+    history = {} if duration is None else {nodeid: Timing(duration) for nodeid in collection.nodeids}
+    scheduler = Scheduler(collection, history, workers=3)
+
+    executed = drain(scheduler, 3)
+
+    assert sorted(index for indices in executed for index in indices) == list(range(12))
+    assert all(indices == sorted(indices) for indices in executed)
+    assert any({0, 4, 8} <= set(indices) for indices in executed)
+    assert any({1, 5, 9} <= set(indices) for indices in executed)
+    assert scheduler.completed_count == 12
+    assert all(scheduler.current(worker) is None and not scheduler.unfinished(worker) for worker in range(3))
+
+
+def test_history_balances_expensive_tests() -> None:
+    durations = [9, 1, 9, 1, 1, 1]
+    collection = Collection(tuple(f"test_{index}" for index in range(6)), (), ())
+    history = {nodeid: Timing(duration) for nodeid, duration in zip(collection.nodeids, durations, strict=True)}
+
+    warm = drain(Scheduler(collection, history, workers=2), 2)
+
+    warm_finish = max(sum(durations[index] for index in indices) for indices in warm)
+    assert warm_finish == sum(durations) / 2
+
+
+@pytest.mark.parametrize(
+    ("records", "used_workers"),
+    [
+        ([], 1),
+        ([Timing(1)] * 4, 1),
+        ([Timing(1, setup=0, call=1, teardown=0)] * 4, 2),
+    ],
+    ids=["cold", "unknown-phases", "parallel-work"],
+)
+def test_fixture_locality_splits_only_with_evidence_of_a_benefit(records: list[Timing], used_workers: int) -> None:
+    collection = Collection(("a", "b", "c", "d"), ((0, 2),), ((0, 1, 2, 3),))
+    history = dict(zip(collection.nodeids, records, strict=False))
+
+    executed = drain(Scheduler(collection, history, workers=2), 2)
+
+    assert sum(bool(indices) for indices in executed) == used_workers
+    assert sorted(index for indices in executed for index in indices) == [0, 1, 2, 3]
+    assert any({0, 2} <= set(indices) for indices in executed)
+
+
+def test_shared_fixture_cost_is_paid_once_per_worker() -> None:
+    collection = Collection(tuple("abcdef"), (), (tuple(range(6)),))
+    history = {nodeid: Timing(1, setup=0, call=1, teardown=0) for nodeid in collection.nodeids}
+    history["a"] = Timing(4, setup=3, call=1, teardown=0)
+
+    executed = drain(Scheduler(collection, history, workers=2), 2)
+
+    assert sorted(index for indices in executed for index in indices) == list(range(6))
+    # Each worker pays three seconds of setup, then one second per test.
+    assert max(3 + len(indices) for indices in executed if indices) == 6
+
+
+def test_rebalancing_moves_unstarted_work_but_preserves_lookahead_ownership() -> None:
+    collection = Collection(tuple(f"test_{index}" for index in range(12)), ((3, 8),), ())
+    durations = [1, 1, 8, 1, 1, 1, 1, 1, 2, 2, 2, 4]
+    history = {nodeid: Timing(duration) for nodeid, duration in zip(collection.nodeids, durations, strict=True)}
+    scheduler = Scheduler(collection, history, workers=2)
+    donor = next(worker for worker in range(2) if 3 in scheduler.unfinished(worker))
+    recipient = 1 - donor
+    original = set(scheduler.unfinished(donor))
+    first = scheduler.dispatch(donor, now=0)
+    assert first is not None
+    scheduler.started(donor, first[0], now=0)
+    dispatched = first
+    while 3 not in dispatched:
+        batch = scheduler.dispatch(donor, now=0)
+        assert batch is not None
+        dispatched += batch
+
+    received: list[int] = []
+    for now in range(1, 13):
+        batch = scheduler.dispatch(recipient, now=float(now))
+        if batch is None:
+            break
+        finish(scheduler, recipient, batch, float(now))
+        received.extend(batch)
+
+    assert original.intersection(received)
+    assert not set(received).intersection((*dispatched, 8))
+    assert scheduler.current(donor) == first[0]
+    assert received == sorted(received)
+
+    scheduler.completed(donor, first[0])
+    finish(scheduler, donor, dispatched[1:], 20)
+    retained = list(dispatched)
+    for now in range(21, 34):
+        batch = scheduler.dispatch(donor, now=float(now))
+        if batch is None:
+            break
+        finish(scheduler, donor, batch, float(now))
+        retained.extend(batch)
+
+    assert retained == sorted(retained)
+    assert sorted((*received, *retained)) == list(range(12))
+    assert scheduler.completed_count == 12
+
+
+def test_out_of_order_worker_events_are_rejected_without_advancing_progress() -> None:
+    scheduler = Scheduler(Collection(("a", "b"), ((0, 1),), ()), {}, workers=1)
+    assert scheduler.dispatch(0, now=0) == (0, 1)
+
+    with pytest.raises(ValueError, match="started unexpected test"):
+        scheduler.started(0, 1, now=0)
+    scheduler.started(0, 0, now=0)
+    with pytest.raises(ValueError, match="completed unexpected test"):
+        scheduler.completed(0, 1)
+
+    assert scheduler.current(0) == 0
+    assert scheduler.completed_count == 0
+    scheduler.completed(0, 0)
+    finish(scheduler, 0, (1,), 1)
+    assert scheduler.completed_count == 2

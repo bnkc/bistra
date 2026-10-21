@@ -1,3 +1,4 @@
+import errno
 import pickle
 import socket
 import struct
@@ -33,19 +34,37 @@ def test_fragmented_message_is_delivered_once():
         channel.close()
 
 
-@pytest.mark.parametrize("tail", ["header", "payload"])
-def test_complete_messages_survive_a_truncated_tail(tail):
+@pytest.mark.parametrize("disconnect", ["eof", "reset"])
+@pytest.mark.parametrize("tail", [None, "header", "payload"])
+def test_disconnect_preserves_messages_and_rejects_partial_frames(monkeypatch, disconnect, tail):
     sender, receiver = socket.socketpair()
     channel = _Channel(receiver)
-    messages = [{"kind": "need"}, {"kind": "finish"}]
+    messages = [
+        {"kind": "need"},
+        {"kind": "finished", "status": 1, "workeroutput": {}, "events": [], "error": None},
+    ]
     packet = frame({"kind": "run", "tests": (4, 5)})
-    truncated = packet[:3] if tail == "header" else packet[:-1]
+    truncated = {None: b"", "header": packet[:3], "payload": packet[:-1]}[tail]
+    recv = socket.socket.recv
+
+    def receive(connection, *args):
+        data = recv(connection, *args)
+        if connection is receiver and not data and disconnect == "reset":
+            raise ConnectionResetError(errno.ECONNRESET, "Connection reset by peer")
+        return data
+
+    monkeypatch.setattr(socket.socket, "recv", receive)
     try:
         sender.sendall(b"".join(frame(message) for message in messages) + truncated)
         sender.shutdown(socket.SHUT_WR)
         assert channel.receive() == messages
-        with pytest.raises(TransportError, match="incomplete message.*before EOF"):
-            channel.receive()
+        assert channel.eof
+        if tail is None:
+            assert channel.error is None
+            assert channel.receive() == []
+        else:
+            with pytest.raises(TransportError, match="incomplete message.*before EOF"):
+                channel.receive()
     finally:
         sender.close()
         channel.close()

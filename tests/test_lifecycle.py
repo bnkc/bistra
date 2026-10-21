@@ -277,6 +277,35 @@ def test_pytest_exit_preserves_reason_and_status(pytester):
         assert "required service is unavailable" in output.read_text()
 
 
+@pytest.mark.parametrize("at_exit", [False, True], ids=["missing-final-result", "failure-after-final-result"])
+def test_worker_exit_requires_a_final_result_and_successful_process_exit(pytester, at_exit):
+    pytester.makeconftest("""
+        from pathlib import Path
+
+        def pytest_testnodedown(node, error):
+            if node.workeroutput.get("ran"):
+                Path("final-received").touch()
+    """)
+    pytester.makepyfile(
+        f"""
+        import atexit
+        import os
+
+        def test_exit(pytestconfig):
+            pytestconfig.workeroutput["ran"] = True
+            if {at_exit!r}:
+                atexit.register(os._exit, 23)
+            else:
+                os._exit(0)
+        """
+    )
+    with running(pytester) as (process, output):
+        assert process.wait(timeout=30) == pytest.ExitCode.INTERNAL_ERROR, output.read_text()
+        assert (pytester.path / "final-received").exists() == at_exit
+        expected = "status 23" if at_exit else "without a final result"
+        assert expected in output.read_text()
+
+
 def test_fail_fast_allows_an_active_test_to_finish(pytester):
     pytester.makepyfile(
         test_failure="""

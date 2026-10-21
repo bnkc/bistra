@@ -207,6 +207,9 @@ class _Channel:
                     chunk = self._socket.recv(min(65536, remaining))
                 except BlockingIOError:
                     return messages
+                except ConnectionResetError:
+                    # Linux resets a socket closed with unread controller commands.
+                    chunk = b""
                 except OSError as error:
                     raise TransportError(f"cannot read worker message: {error}") from error
                 if not chunk:

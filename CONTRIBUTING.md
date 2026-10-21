@@ -20,7 +20,8 @@ uv run --locked tox -e py,lint,type,package
 ```
 
 Pre-commit runs Ruff, ty, and the full test suite on every commit.
-For a quick local test run, use `uv run --locked bistra`.
+For a quick local test run, use `uv run --locked pytest`.
+To check Bistra against its own suite, use `uv run --locked bistra -j 2`.
 
 ## Builds
 

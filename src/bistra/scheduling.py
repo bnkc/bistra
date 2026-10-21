@@ -1,92 +1,178 @@
-"""Balance fixture groups across workers without changing collection order."""
-
 import heapq
 import math
 from collections import deque
 from collections.abc import Mapping, Sequence
-from typing import SupportsFloat, SupportsIndex, cast
+from dataclasses import dataclass, field
+from itertools import groupby
+from typing import TypeAlias
+
+from .timings import Timing
+
+Batch: TypeAlias = tuple[int, ...]
+_REBALANCE_INTERVAL = 0.05
+_MIN_TRANSFER_SECONDS = 0.01
 
 
-def _valid_duration(value: object) -> float | None:
-    # Reject booleans even though Python treats them as numbers.
-    if isinstance(value, bool):
-        return None
-    try:
-        number = float(cast(str | bytes | bytearray | SupportsFloat | SupportsIndex, value))
-    except (TypeError, ValueError, OverflowError):
-        return None
-    return number if math.isfinite(number) and number >= 0 else None
+@dataclass(frozen=True)
+class Collection:
+    """Groups may overlap. Required groups stay together; fixture groups may split.
+
+    Splitting must justify the extra fixture setup and teardown.
+    """
+
+    nodeids: tuple[str, ...]
+    required_groups: tuple[Batch, ...]
+    fixture_groups: tuple[Batch, ...]
 
 
-def estimate_durations(indices: Sequence[int], durations: Mapping[int, object]) -> dict[int, float]:
-    """Fill missing estimates with the mean of the selected tests' positive timings."""
-    known = {index: _valid_duration(durations.get(index)) for index in indices}
-    positive = [value for value in known.values() if value is not None and value > 0]
+@dataclass
+class _Slot:
+    queued: deque[Batch]
+    queued_seconds: float
+    pending: deque[int] = field(default_factory=deque)
+    pending_seconds: float = 0.0
+    running: tuple[int, float] | None = None
+    last_dispatched: int = -1
+    last_balance: float = -math.inf
+    exhausted: bool = False
+
+
+class Scheduler:
+    """Preserve collection order within each worker.
+
+    Dispatch fixes a whole group's worker, including lookahead. Only
+    undispatched groups can move. All timestamps are monotonic seconds.
+    """
+
+    def __init__(self, collection: Collection, history: Mapping[str, Timing], *, workers: int) -> None:
+        if workers < 1:
+            raise ValueError("workers must be positive")
+        try:
+            self._weights = _estimates(collection.nodeids, history)
+            self._groups, self._weights = _plan(collection, history, self._weights, workers)
+            math.fsum(self._weights)
+        except (OverflowError, ValueError):
+            # Individually finite history can still overflow when summed.
+            self._weights = (1.0,) * len(collection.nodeids)
+            self._groups, self._weights = _plan(collection, {}, self._weights, workers)
+        self._group_for = {index: group for group, members in enumerate(self._groups) for index in members}
+        self._costs = tuple(math.fsum(self._weights[index] for index in group) for group in self._groups)
+        self._slots = [
+            _Slot(_batches(indices, self._group_for), math.fsum(self._weights[index] for index in indices))
+            for indices in _assign(self._groups, self._weights, workers)
+        ]
+        self._locked: set[int] = set()
+        self._completed_count = 0
+
+    @property
+    def completed_count(self) -> int:
+        return self._completed_count
+
+    def current(self, worker: int) -> int | None:
+        running = self._slots[worker].running
+        return None if running is None else running[0]
+
+    def unfinished(self, worker: int) -> tuple[int, ...]:
+        slot = self._slots[worker]
+        return (*slot.pending, *(index for batch in slot.queued for index in batch))
+
+    def dispatch(self, worker: int, *, now: float) -> Batch | None:
+        slot = self._slots[worker]
+        if slot.exhausted:
+            return None
+        if slot.last_dispatched >= 0:
+            self._rebalance(worker, now)
+        if not slot.queued:
+            slot.exhausted = True
+            return None
+        batch = slot.queued.popleft()
+        cost = math.fsum(self._weights[index] for index in batch)
+        slot.queued_seconds -= cost
+        slot.pending_seconds += cost
+        slot.pending.extend(batch)
+        slot.last_dispatched = batch[-1]
+        self._locked.add(self._group_for[batch[0]])
+        return batch
+
+    def started(self, worker: int, index: int, *, now: float) -> None:
+        slot = self._slots[worker]
+        if slot.running is not None or not slot.pending or slot.pending[0] != index:
+            raise ValueError(f"worker {worker} started unexpected test {index}")
+        slot.running = (index, now)
+
+    def completed(self, worker: int, index: int) -> None:
+        slot = self._slots[worker]
+        if slot.running is None or slot.running[0] != index:
+            raise ValueError(f"worker {worker} completed unexpected test {index}")
+        slot.pending.popleft()
+        slot.pending_seconds -= self._weights[index]
+        slot.running = None
+        self._completed_count += 1
+
+    def _remaining(self, slot: _Slot, now: float) -> float:
+        remaining = slot.queued_seconds + slot.pending_seconds
+        if slot.running is not None:
+            index, start = slot.running
+            remaining -= min(self._weights[index], max(0.0, now - start))
+        return max(0.0, remaining)
+
+    def _rebalance(self, worker: int, now: float) -> None:
+        slot = self._slots[worker]
+        # Scanning on every fast test costs more than small transfers save.
+        if len(self._slots) < 2 or now - slot.last_balance < _REBALANCE_INTERVAL:
+            return
+        slot.last_balance = now
+        remaining = [self._remaining(other, now) for other in self._slots]
+        for donor in sorted(range(len(self._slots)), key=lambda candidate: -remaining[candidate]):
+            gap = remaining[donor] - remaining[worker]
+            if gap < 2 * _MIN_TRANSFER_SECONDS:
+                return
+            eligible: set[int] = set()
+            for batch in self._slots[donor].queued:
+                group = self._group_for[batch[0]]
+                if group not in self._locked and self._groups[group][0] > slot.last_dispatched:
+                    eligible.add(group)
+            selected: set[int] = set()
+            cost = 0.0
+            for group in sorted(eligible, key=lambda group: (-self._costs[group], self._groups[group][0])):
+                weight = self._costs[group]
+                if weight > 0 and cost + weight <= gap / 2:
+                    selected.add(group)
+                    cost += weight
+            if cost >= _MIN_TRANSFER_SECONDS:
+                self._transfer(donor, worker, selected, cost)
+                return
+
+    def _transfer(self, donor: int, recipient: int, groups: set[int], cost: float) -> None:
+        source, target = self._slots[donor], self._slots[recipient]
+        retained: deque[Batch] = deque()
+        indices = [index for batch in target.queued for index in batch]
+        for batch in source.queued:
+            if self._group_for[batch[0]] in groups:
+                indices.extend(batch)
+            else:
+                retained.append(batch)
+        source.queued = retained
+        target.queued = _batches(sorted(indices), self._group_for)
+        source.queued_seconds -= cost
+        target.queued_seconds += cost
+
+
+def _estimates(nodeids: Sequence[str], history: Mapping[str, Timing]) -> tuple[float, ...]:
+    known = [history[nodeid].total if nodeid in history else None for nodeid in nodeids]
+    positive = [value for value in known if value is not None and value > 0]
+    fallback = 1.0
     if positive:
-        # Scale before averaging to avoid overflow when adding large durations.
         scale = max(positive)
         fallback = math.fsum(value / scale for value in positive) / len(positive) * scale
-    else:
-        fallback = 1.0
-    weights = {index: fallback if value is None else value for index, value in known.items()}
-    try:
-        total = math.fsum(weights.values())
-    except OverflowError as exc:
-        raise ValueError("total estimated duration is too large to represent") from exc
-    if not math.isfinite(total):
-        raise ValueError("total estimated duration is too large to represent")
+    weights = tuple(fallback if value is None else value for value in known)
+    if not math.isfinite(math.fsum(weights)):
+        raise ValueError("total estimated duration is not finite")
     return weights
 
 
-def plan_workers(
-    indices: Sequence[int],
-    groups: Sequence[Sequence[int]],
-    workers: int,
-    durations: Mapping[int, object],
-) -> list[list[list[int]]]:
-    """Balance whole fixture groups, then restore each worker's collection order.
-
-    Batches end where affinity groups change. This keeps lookahead accurate while
-    allowing the executor to stop between groups instead of buffering a full run.
-    """
-    if not groups:
-        return []
-    weights = estimate_durations(indices, durations)
-    costs = [math.fsum(weights[index] for index in group) for group in groups]
-    slots = [(0.0, 0, worker) for worker in range(min(workers, len(groups)))]
-    owners = {}
-    for group_id in sorted(range(len(groups)), key=lambda i: -costs[i]):
-        total, count, worker = heapq.heappop(slots)
-        for index in groups[group_id]:
-            owners[index] = (worker, group_id)
-        heapq.heappush(slots, (total + costs[group_id], count + len(groups[group_id]), worker))
-    batches: list[list[list[int]]] = [[] for _ in slots]
-    previous: dict[int, int] = {}
-    for index in indices:
-        worker, group_id = owners[index]
-        if previous.get(worker) != group_id:
-            batches[worker].append([])
-            previous[worker] = group_id
-        batches[worker][-1].append(index)
-    return batches
-
-
-def refine_fixture_groups(
-    indices: Sequence[int],
-    groups: Sequence[Sequence[int]],
-    required: Sequence[Sequence[int]],
-    workers: int,
-    history: Mapping[int, Mapping[str, float]],
-) -> list[list[int]]:
-    """Trade ordinary fixture reuse for parallelism when history makes it cheap.
-
-    Required groups are indivisible. Ordinary scoped fixtures may have one
-    instance per worker, just as session fixtures do. Without complete timing
-    history, keep the original locality. For each extra replica, charge the
-    *entire* group's measured setup and teardown, including function fixtures:
-    a deliberately conservative estimate, without guessing fixture identities.
-    """
-    roots = {index: index for index in indices}
+def _merge_groups(count: int, groups: Sequence[Batch]) -> tuple[Batch, ...]:
+    roots = list(range(count))
 
     def root(index: int) -> int:
         while roots[index] != index:
@@ -94,171 +180,95 @@ def refine_fixture_groups(
             index = roots[index]
         return index
 
-    def combine(collections: Sequence[Sequence[int]]) -> list[list[int]]:
-        for members in collections:
-            for index in members[1:]:
-                roots[root(index)] = root(members[0])
-        combined: dict[int, list[int]] = {}
-        for index in indices:
-            combined.setdefault(root(index), []).append(index)
-        return list(combined.values())
+    for group in groups:
+        for index in group[1:]:
+            roots[root(index)] = root(group[0])
+    combined: dict[int, list[int]] = {}
+    for index in range(count):
+        combined.setdefault(root(index), []).append(index)
+    return tuple(tuple(group) for group in combined.values())
 
-    # Explicit groups may cross fixture boundaries. Merge those boundaries for
-    # locality, but retain the explicit groups themselves as indivisible atoms.
-    atoms = combine(required)
+
+def _plan(
+    collection: Collection, history: Mapping[str, Timing], weights: Sequence[float], workers: int
+) -> tuple[tuple[Batch, ...], tuple[float, ...]]:
+    """Estimate shared fixture work as phase time above each group's minimum.
+
+    The minimum is a per-test baseline. Excess may include slow individual
+    setups, so this deliberately coarse estimate can overstate shared work.
+    """
+    atoms = _merge_groups(len(weights), collection.required_groups)
     atom_for = {index: atom for atom in atoms for index in atom}
-    locality = combine(groups)
-    weights = estimate_durations(indices, {i: record["total"] for i, record in history.items() if "total" in record})
-    # Replication cannot beat the suite's average worker load or its longest
-    # indivisible group. Below that floor, extra fixtures buy no parallelism.
+    locality = _merge_groups(len(weights), (*atoms, *collection.fixture_groups))
+    # Splitting below this floor cannot improve the suite's expected finish.
+    total = math.fsum(weights)
+    average = total / workers
     floor = max(
-        math.fsum(weights.values()) / max(workers, 1),
-        max((math.fsum(weights[i] for i in atom) for atom in atoms), default=0.0),
+        average,
+        max((math.fsum(weights[index] for index in atom) for atom in atoms), default=0.0),
     )
-    result: list[list[int]] = []
+    result: list[Batch] = []
+    planned_weights = list(weights)
     for members in locality:
         parts = [atom_for[index] for index in members if atom_for[index][0] == index]
-        if workers < 2 or len(parts) < 2:
-            result.append(members)
-            continue
-        best = [members]
         cost = math.fsum(weights[index] for index in members)
-        if cost <= floor:
+        if workers == 1 or len(parts) == 1 or cost <= floor:
             result.append(members)
             continue
+        records = [history.get(collection.nodeids[index]) for index in members]
         phases = [
-            _valid_duration(history.get(index, {}).get(phase))
-            for index in members
-            for phase in ("total", "setup", "teardown")
+            (record.setup, record.teardown)
+            for record in records
+            if record is not None and record.setup is not None and record.teardown is not None
         ]
-        if all(value is not None for value in phases):
-            # Setup/teardown are an upper estimate of the reusable portion. Do
-            # not subtract them from test weights; the original instance still
-            # has to run. Saturate implausibly large phase totals at group cost.
-            overhead = 0.0
-            for index in members:
-                overhead = min(cost, overhead + history[index]["setup"] + history[index]["teardown"])
-            best_cost = cost
-            largest = max(math.fsum(weights[i] for i in part) for part in parts)
-            for count in range(2, min(workers, len(parts)) + 1):
-                if max(floor, largest, cost / count) + (count - 1) * overhead >= best_cost:
-                    continue
-                plans = plan_workers(members, parts, count, weights)
-                chunks = [[i for batch in plan for i in batch] for plan in plans]
-                longest = max(math.fsum(weights[i] for i in chunk) for chunk in chunks)
-                projected = max(floor, longest) + (count - 1) * overhead
-                if projected < best_cost:
-                    best, best_cost = chunks, projected
-        result.extend(best)
-    positions = {index: position for position, index in enumerate(indices)}
-    return sorted(result, key=lambda members: positions[members[0]])
+        if len(phases) != len(members):
+            result.append(members)
+            continue
+        baseline_setup = min(setup for setup, _ in phases)
+        baseline_teardown = min(teardown for _, teardown in phases)
+        per_test = {index: weights[index] for index in members}
+        shared_parts = []
+        for index, (setup, teardown) in zip(members, phases, strict=True):
+            shared = min(weights[index], setup - baseline_setup + teardown - baseline_teardown)
+            shared_parts.append(shared)
+            per_test[index] -= shared
+        shared = math.fsum(shared_parts)
+        # Reserve a proportional share of workers for the rest of the suite.
+        count = min(workers, len(parts), int(cost / total * workers))
+        if count < 2:
+            result.append(members)
+            continue
+        chunks = _assign(parts, per_test, count)
+        longest = max(math.fsum(per_test[index] for index in chunk) for chunk in chunks)
+        # Each worker pays shared setup concurrently, once on its own path.
+        if max(floor, shared + longest) >= cost:
+            result.append(members)
+            continue
+        for index in members:
+            planned_weights[index] = per_test[index]
+        for chunk in chunks:
+            planned_weights[chunk[0]] += shared
+        result.extend(chunks)
+    groups = tuple(sorted(result, key=lambda group: group[0]))
+    if groups != locality and _makespan(groups, planned_weights, workers) < _makespan(locality, weights, workers):
+        return groups, tuple(planned_weights)
+    return locality, tuple(weights)
 
 
-class WorkScheduler:
-    """Rebalance unstarted groups before a worker passes them in collection order.
+def _makespan(groups: Sequence[Batch], weights: Sequence[float], workers: int) -> float:
+    return max(math.fsum(weights[index] for index in indices) for indices in _assign(groups, weights, workers))
 
-    Dispatch locks an entire affinity group to its worker, including any later
-    batches. Lookahead counts as dispatch: promised next items cannot move.
-    """
 
-    def __init__(
-        self,
-        indices: Sequence[int],
-        groups: Sequence[Sequence[int]],
-        plans: list[list[list[int]]],
-        durations: Mapping[int, object],
-    ) -> None:
-        self.positions = {index: rank for rank, index in enumerate(indices)}
-        self.groups = groups
-        self.group_for = {index: group for group, members in enumerate(groups) for index in members}
-        self.weights = estimate_durations(indices, durations)
-        self.costs = [math.fsum(self.weights[index] for index in group) for group in groups]
-        self.queues = [deque(batches) for batches in plans]
-        self.queued = [math.fsum(self.weights[i] for batch in queue for i in batch) for queue in self.queues]
-        self.pending = [0.0] * len(plans)
-        self.running: list[tuple[int, float] | None] = [None] * len(plans)
-        self.bounds = [-1] * len(plans)
-        self.last_balance = [-math.inf] * len(plans)
-        self.locked: set[int] = set()
+def _assign(groups: Sequence[Batch], weights: Sequence[float] | Mapping[int, float], workers: int) -> list[Batch]:
+    costs = [math.fsum(weights[index] for index in group) for group in groups]
+    slots = [(0.0, 0, worker) for worker in range(workers)]
+    assigned: list[list[int]] = [[] for _ in slots]
+    for group in sorted(range(len(groups)), key=lambda group: -costs[group]):
+        total, count, worker = heapq.heappop(slots)
+        assigned[worker].extend(groups[group])
+        heapq.heappush(slots, (total + costs[group], count + len(groups[group]), worker))
+    return [tuple(sorted(indices)) for indices in assigned]
 
-    def started(self, worker: int, index: int, now: float) -> None:
-        self.running[worker] = (index, now)
 
-    def completed(self, worker: int, index: int) -> None:
-        self.pending[worker] -= self.weights[index]
-        self.running[worker] = None
-
-    def take(self, worker: int, now: float, *, rebalance: bool = True) -> list[int] | None:
-        if rebalance:
-            self._rebalance(worker, now)
-        queue = self.queues[worker]
-        if not queue:
-            return None
-        batch = queue.popleft()
-        cost = math.fsum(self.weights[index] for index in batch)
-        self.queued[worker] -= cost
-        self.pending[worker] += cost
-        self.bounds[worker] = self.positions[batch[-1]]
-        self.locked.update(self.group_for[index] for index in batch)
-        return batch
-
-    def _remaining(self, worker: int, now: float) -> float:
-        remaining = self.queued[worker] + self.pending[worker]
-        running = self.running[worker]
-        if running is not None:
-            index, start = running
-            remaining -= min(self.weights[index], max(0.0, now - start))
-        return max(0.0, remaining)
-
-    def _rebalance(self, worker: int, now: float) -> None:
-        # Avoid repeatedly scanning queues for tiny changes or every fast test.
-        if len(self.queues) < 2 or now - self.last_balance[worker] < 0.05:
-            return
-        self.last_balance[worker] = now
-        remaining = [self._remaining(slot, now) for slot in range(len(self.queues))]
-        # The busiest worker may have no transferable groups. Try other donors
-        # before giving up, keeping the same ownership and ordering constraints.
-        for donor in sorted(range(len(self.queues)), key=lambda slot: -remaining[slot]):
-            gap = remaining[donor] - remaining[worker]
-            if gap < max(0.1, remaining[worker] * 0.2):
-                return
-            eligible = {
-                self.group_for[batch[0]]
-                for batch in self.queues[donor]
-                if self.group_for[batch[0]] not in self.locked
-                and self.positions[self.groups[self.group_for[batch[0]]][0]] > self.bounds[worker]
-            }
-            selected: set[int] = set()
-            cost = 0.0
-            for group in sorted(
-                eligible, key=lambda group: (-self.costs[group], self.positions[self.groups[group][0]])
-            ):
-                weight = self.costs[group]
-                if weight > 0 and cost + weight <= gap / 2:
-                    selected.add(group)
-                    cost += weight
-            if cost < 0.01:
-                continue
-            moved: list[int] = []
-            retained: deque[list[int]] = deque()
-            for batch in self.queues[donor]:
-                if self.group_for[batch[0]] in selected:
-                    moved.extend(batch)
-                else:
-                    retained.append(batch)
-            self.queues[donor] = retained
-            indices = sorted(
-                [*moved, *(i for batch in self.queues[worker] for i in batch)], key=self.positions.__getitem__
-            )
-            merged: deque[list[int]] = deque()
-            previous = None
-            for index in indices:
-                group = self.group_for[index]
-                if previous != group:
-                    merged.append([])
-                    previous = group
-                merged[-1].append(index)
-            self.queues[worker] = merged
-            self.queued[donor] -= cost
-            self.queued[worker] += cost
-            return
+def _batches(indices: Sequence[int], group_for: Mapping[int, int]) -> deque[Batch]:
+    return deque(tuple(members) for _, members in groupby(indices, key=group_for.__getitem__))

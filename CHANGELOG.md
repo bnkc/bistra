@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.1.0a10 (Unreleased)
+## 0.1.0 (2026-10-22)
 
 - Duration-aware parallel pytest execution on Linux and macOS with cached test
   timings and fresh worker interpreters.

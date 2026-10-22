@@ -6,6 +6,41 @@ import pytest
 from bistra import timings
 
 
+@pytest.mark.parametrize("workers", [1, 2])
+def test_timing_history_keeps_call_time_in_total(pytester: pytest.Pytester, workers: int) -> None:
+    pytester.makeconftest("""
+        import json
+        from pathlib import Path
+
+        phases = {}
+
+        def pytest_runtest_logreport(report):
+            phases[report.when] = report.duration
+
+        def pytest_sessionfinish(session):
+            if not hasattr(session.config, "workerinput"):
+                Path("phases.json").write_text(json.dumps(phases))
+    """)
+    pytester.makepyfile(test_example="def test_body(): assert sum(range(1000)) == 499500")
+
+    result = pytester.run(sys.executable, "-m", "bistra", "-j", str(workers), "-q", timeout=30)
+
+    assert result.ret == 0
+    result.assert_outcomes(passed=1)
+    phases = json.loads((pytester.path / "phases.json").read_text())
+    cache = json.loads((pytester.path / ".bistra_cache" / "timings.json").read_text())
+    (records,) = cache["environments"].values()
+    record = records["test_example.py::test_body"]
+    assert set(record) == {"total", "setup", "teardown"}
+    assert record["setup"] == phases["setup"]
+    assert record["teardown"] == phases["teardown"]
+    assert phases["call"] > 0
+    if workers == 1:
+        assert record["total"] == pytest.approx(sum(phases.values()))
+    else:
+        assert record["total"] >= sum(phases.values())
+
+
 def test_serial_cold_and_warm_runs_preserve_outcomes_and_execute_each_body_once(pytester: pytest.Pytester) -> None:
     pytester.makeconftest("""
         import json

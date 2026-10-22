@@ -13,7 +13,7 @@ from bistra.timings import Timing
 
 def test_cache_round_trip_and_environment_separation(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     assert timings.load(tmp_path) == {}
-    first = {"test_example.py::test_a": Timing(4, setup=1, call=2, teardown=1)}
+    first = {"test_example.py::test_a": Timing(4, setup=1, teardown=1)}
     timings.save(tmp_path, first)
     key = timings.environment_key()
     cache = tmp_path / ".bistra_cache"
@@ -21,7 +21,7 @@ def test_cache_round_trip_and_environment_separation(tmp_path: Path, monkeypatch
     assert timings.load(tmp_path) == first
     assert json.loads((cache / "timings.json").read_text()) == {
         "version": 2,
-        "environments": {key: {"test_example.py::test_a": {"total": 4, "setup": 1, "call": 2, "teardown": 1}}},
+        "environments": {key: {"test_example.py::test_a": {"total": 4, "setup": 1, "teardown": 1}}},
     }
     assert (cache / ".gitignore").read_text() == "*\n"
 
@@ -36,15 +36,38 @@ def test_cache_round_trip_and_environment_separation(tmp_path: Path, monkeypatch
 
 
 def test_updates_average_measurements_and_retain_unmeasured_tests_and_phases(tmp_path: Path) -> None:
-    untouched = Timing(7, setup=1, call=5, teardown=1)
-    timings.save(tmp_path, {"untouched": untouched, "updated": Timing(8, setup=2, call=4)})
+    untouched = Timing(7, setup=1, teardown=1)
+    timings.save(tmp_path, {"untouched": untouched, "updated": Timing(8, setup=2, teardown=4)})
 
-    timings.save(tmp_path, {"updated": Timing(4, call=2, teardown=1), "new": Timing(3)})
+    timings.save(tmp_path, {"updated": Timing(4, teardown=2), "new": Timing(3)})
 
     assert timings.load(tmp_path) == {
         "untouched": untouched,
-        "updated": Timing(6, setup=2, call=3, teardown=1),
+        "updated": Timing(6, setup=2, teardown=3),
         "new": Timing(3),
+    }
+
+
+def test_saving_old_history_drops_call_without_losing_other_measurements(tmp_path: Path) -> None:
+    path = tmp_path / ".bistra_cache" / "timings.json"
+    path.parent.mkdir()
+    record = {"total": 9, "setup": 2, "call": 4, "teardown": 1}
+    key = timings.environment_key()
+    path.write_text(
+        json.dumps({"version": 2, "environments": {key: {"unselected": record}, "other-env": {"other": record}}})
+    )
+
+    assert timings.load(tmp_path) == {"unselected": Timing(9, setup=2, teardown=1)}
+
+    timings.save(tmp_path, {"selected": Timing(3)})
+
+    kept = {"total": 9, "setup": 2, "teardown": 1}
+    assert json.loads(path.read_text()) == {
+        "version": 2,
+        "environments": {
+            key: {"unselected": kept, "selected": {"total": 3}},
+            "other-env": {"other": kept},
+        },
     }
 
 
@@ -68,7 +91,7 @@ def test_bad_measurements_do_not_discard_valid_history(tmp_path: Path) -> None:
                 "version": 2,
                 "environments": {
                     timings.environment_key(): {
-                        "valid": {"total": 5, "setup": -1, "call": 2, "teardown": "unknown"},
+                        "valid": {"total": 5, "setup": -1, "teardown": "unknown"},
                         "negative": {"total": -1},
                         "infinite": {"total": float("inf")},
                         "boolean": {"total": True},
@@ -79,7 +102,7 @@ def test_bad_measurements_do_not_discard_valid_history(tmp_path: Path) -> None:
         )
     )
 
-    assert timings.load(tmp_path) == {"valid": Timing(5, call=2)}
+    assert timings.load(tmp_path) == {"valid": Timing(5)}
 
 
 def test_failed_atomic_replace_preserves_previous_cache(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

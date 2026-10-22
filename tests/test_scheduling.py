@@ -62,7 +62,7 @@ def test_history_balances_expensive_tests() -> None:
     [
         ([], 1),
         ([Timing(1)] * 4, 1),
-        ([Timing(1, setup=0, call=1, teardown=0)] * 4, 2),
+        ([Timing(1, setup=0, teardown=0)] * 4, 2),
     ],
     ids=["cold", "unknown-phases", "parallel-work"],
 )
@@ -79,8 +79,8 @@ def test_fixture_locality_splits_only_with_evidence_of_a_benefit(records: list[T
 
 def test_shared_fixture_cost_is_paid_once_per_worker() -> None:
     collection = Collection(tuple("abcdef"), (), (tuple(range(6)),))
-    history = {nodeid: Timing(1, setup=0, call=1, teardown=0) for nodeid in collection.nodeids}
-    history["a"] = Timing(4, setup=3, call=1, teardown=0)
+    history = {nodeid: Timing(1, setup=0, teardown=0) for nodeid in collection.nodeids}
+    history["a"] = Timing(4, setup=3, teardown=0)
 
     executed = drain(Scheduler(collection, history, workers=2), 2)
 

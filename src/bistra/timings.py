@@ -16,7 +16,6 @@ class Timing:
 
     total: float
     setup: float | None = None
-    call: float | None = None
     teardown: float | None = None
 
 
@@ -40,7 +39,6 @@ def _merge(history: Mapping[str, Timing], measured: Mapping[str, Timing]) -> dic
             else Timing(
                 total=previous.total * 0.5 + sample.total * 0.5,
                 setup=_average(previous.setup, sample.setup),
-                call=_average(previous.call, sample.call),
                 teardown=_average(previous.teardown, sample.teardown),
             )
         )
@@ -130,13 +128,12 @@ def _decode(value: object) -> Timing | None:
     return Timing(
         total=total,
         setup=_seconds(value.get("setup")),
-        call=_seconds(value.get("call")),
         teardown=_seconds(value.get("teardown")),
     )
 
 
 def _encode(record: Timing) -> dict[str, float]:
-    phases = (("setup", record.setup), ("call", record.call), ("teardown", record.teardown))
+    phases = (("setup", record.setup), ("teardown", record.teardown))
     return {"total": record.total, **{name: value for name, value in phases if value is not None}}
 
 

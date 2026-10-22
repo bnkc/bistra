@@ -310,7 +310,7 @@ class Controller:
             nodeid = self.collection.nodeids[index]
             phases = self.phases.pop(nodeid, {})
             self.measured[nodeid] = Timing(
-                message["elapsed"], phases.get("setup"), phases.get("call"), phases.get("teardown")
+                message["elapsed"], setup=phases.get("setup"), teardown=phases.get("teardown")
             )
         elif message["kind"] == "finished":
             state.finished = True
@@ -478,9 +478,7 @@ class Controller:
             if self.recording:
                 if not self.parallel:
                     self.measured = {
-                        nodeid: Timing(
-                            sum(phases.values()), phases.get("setup"), phases.get("call"), phases.get("teardown")
-                        )
+                        nodeid: Timing(sum(phases.values()), setup=phases.get("setup"), teardown=phases.get("teardown"))
                         for nodeid, phases in self.phases.items()
                     }
                 try:

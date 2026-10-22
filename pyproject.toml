@@ -5,7 +5,7 @@ build-backend = "uv_build"
 [project]
 name = "bistra"
 description = "Duration-aware parallel execution for pytest"
-version = "0.1.0a10"
+version = "0.1.0"
 readme = "README.md"
 requires-python = ">=3.11"
 authors = [{ name = "Lev Ostatnigrosh" }]
@@ -13,7 +13,6 @@ license = "MIT"
 license-files = ["LICENSE"]
 classifiers = [
     "Framework :: Pytest",
-    "Development Status :: 3 - Alpha",
     "Intended Audience :: Developers",
     "Topic :: Software Development :: Testing",
     "Operating System :: POSIX :: Linux",

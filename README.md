@@ -1,55 +1,91 @@
 <p align="center">
-  <img src=".github/assets/bistra.svg" alt="Bistra" width="100%">
+  <img src="https://raw.githubusercontent.com/bnkc/bistra/main/.github/assets/bistra.svg" alt="Bistra" width="100%">
 </p>
 
-> **Pre-alpha.** Bistra is a work in progress. Expect bugs, missing features, and
-> breaking changes. It's ready to experiment with, but not to rely on yet.
+[![PyPI](https://img.shields.io/pypi/v/bistra.svg)](https://pypi.org/project/bistra/)
+[![CI](https://github.com/bnkc/bistra/actions/workflows/main.yml/badge.svg?branch=main)](https://github.com/bnkc/bistra/actions/workflows/main.yml)
 
-**Less waiting for pytest.**
+An extremely fast, highly opinionated test scheduler for pytest.
 
-Bistra runs your tests in parallel and uses timings from previous runs to balance
-work across workers. You get pytest's assertions, fixtures, and reports,
-with pytest as the only runtime dependency.
+The name comes from the Russian **быстро** (*bystro*), meaning “fast” or “quickly.”
 
-## Try it
+Bistra is built for real test suites with uneven runtimes. It uses timing history
+to balance work across workers and reduce the wait for the last worker.
 
-Install your local Bistra checkout in the project you want to test:
+Run your tests with `bistra`. Keep your pytest fixtures, plugins, and options.
+
+## Benchmarks
+
+Benchmarked on nine open-source projects, including pytest, Polars, SQLAlchemy,
+and Textual. Charts show one project.
+
+- **Machine:** Apple M4 Max, macOS.
+- **Workers:** 12 for Bistra and xdist; 1 for pytest.
+- **Timing history:** none for cold runs, reused for warm runs.
+
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/bnkc/bistra/main/.github/assets/benchmark-cold-dark.svg">
+    <img src="https://raw.githubusercontent.com/bnkc/bistra/main/.github/assets/benchmark-cold-light.svg" alt="Selected urllib3 cold run: Bistra 13.72 seconds, pytest-xdist 23.52 seconds, pytest 83.00 seconds." width="720">
+  </picture>
+</p>
+
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/bnkc/bistra/main/.github/assets/benchmark-warm-dark.svg">
+    <img src="https://raw.githubusercontent.com/bnkc/bistra/main/.github/assets/benchmark-warm-light.svg" alt="Selected urllib3 warm run: Bistra 11.62 seconds, pytest-xdist 23.52 seconds, pytest 83.00 seconds." width="720">
+  </picture>
+</p>
+
+## Installation
 
 ```sh
-uv add --dev /path/to/bistra
+uv add --dev bistra
 uv run bistra
 ```
 
-## Compatibility
+Use your usual pytest options with `bistra`.
 
-Each worker collects tests independently and runs its own session fixtures.
-Collection must be consistent across workers, and tests need to isolate shared
-databases and files. The `worker_id` and `testrun_uid` fixtures can help with that.
-The controller schedules the workers' agreed inventory without collecting the
-suite again.
+Workers default to the available CPU count. Override with `-j` or `--workers`:
 
-Duration history balances work across workers. A fixture group that limits
-parallelism may be split when the predicted gain outweighs repeated setup and
-teardown. Cold runs retain fixture locality; `xdist_group` marks always keep
-tests together. Each worker runs its assigned tests in collection order.
-Unstarted groups can move to a worker with less work remaining, provided that
-preserves its collection order. Once dispatched, a group stays on the same worker.
+```sh
+uv run bistra -j 8
+```
 
-The controller runs project setup before starting workers. Existing
-`pytest_configure_node` hooks can populate `node.workerinput`; workers return
-`config.workeroutput` to `pytest_testnodedown` for cleanup. Shared resources stay
-available until workers finish. This supports local resource hooks, not xdist
-gateways or custom xdist schedulers.
+Try a few worker counts; the fastest setting depends on your machine and test suite.
 
-With pytest-cov installed, use its normal options, for example
-`bistra --cov=my_package --cov-report=xml`. Bistra combines worker coverage before
-generating reports and checking coverage thresholds. Versions 5–7 are tested.
+## For coding agents
 
-Don't combine Bistra with xdist worker options. Compatibility with Testmon and
-other plugins that control test execution hasn't been verified yet.
+Paste this into your agent:
+
+```text
+Install Bistra and switch our local and CI test commands to `uv run bistra`.
+Keep our existing plugins and test settings, remove xdist scheduling options,
+and check that the tests still pass.
+```
+
+## Plugins
+
+Works with **pytest-cov** and **pytest-testmon** using their usual options:
+
+```sh
+uv run bistra --cov=my_package --cov-report=xml
+uv run bistra --testmon
+```
+
+Bistra replaces xdist scheduling. Remove xdist options (`-n`, `--dist`,
+`--looponfail`) from your commands and pytest config; xdist can stay installed.
+
+## Optimizations
+
+- **Timing history.** Balances work using past test runtimes.
+- **Fixture locality.** Keeps tests with shared fixtures together unless splitting
+  them is predicted to be faster.
+- **Dynamic rebalancing.** Redistributes queued work as workers become available.
+- **Less collection work.** Reuses worker collection results in the controller.
 
 ## Contributing
 
-Trying Bistra on a real test suite is a big help.
-[Report what breaks](https://github.com/bnkc/bistra/issues), or see the
-[contributing guide](CONTRIBUTING.md) to work on the code.
+Bistra is early-stage software: expect bugs and breaking changes.
+[Issues](https://github.com/bnkc/bistra/issues) and PRs are welcome.
+See [CONTRIBUTING.md](https://github.com/bnkc/bistra/blob/main/CONTRIBUTING.md) to get started.

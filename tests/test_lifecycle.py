@@ -127,6 +127,23 @@ def test_worker_resources_outlive_pytest_and_process_cleanup(pytester):
         assert not list(pytester.path.glob("resource-*"))
 
 
+def test_worker_has_time_for_slow_interpreter_shutdown(pytester):
+    pytester.makeconftest(
+        """
+        import atexit
+        import os
+        import time
+
+        if os.environ.get("PYTEST_XDIST_WORKER") == "bistra0":
+            atexit.register(time.sleep, 2.5)
+        """
+    )
+    pytester.makepyfile("def test_passes(): pass")
+
+    with running(pytester) as (process, output):
+        assert process.wait(timeout=30) == 0, output.read_text()
+
+
 def test_partial_worker_provisioning_is_cleaned_up(pytester):
     pytester.makeconftest(
         """

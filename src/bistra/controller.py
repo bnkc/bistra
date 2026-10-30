@@ -19,7 +19,8 @@ from .reports import replay
 from .scheduling import Collection, Scheduler
 from .timings import Timing
 
-SHUTDOWN_TIMEOUT = 2.0
+CANCEL_TIMEOUT = 2.0
+WORKER_EXIT_TIMEOUT = 10.0
 
 
 @dataclass(frozen=True)
@@ -229,7 +230,7 @@ class Controller:
             else:
                 self._dispatch()
             if all(state.finished for state in self.workers.values()) and self.shutdown_deadline is None:
-                self.shutdown_deadline = time.monotonic() + SHUTDOWN_TIMEOUT
+                self.shutdown_deadline = time.monotonic() + WORKER_EXIT_TIMEOUT
             if self.shutdown_deadline is not None and time.monotonic() >= self.shutdown_deadline:
                 break
 
@@ -370,14 +371,16 @@ class Controller:
             phases[report.when] = phases.get(report.when, 0.0) + report.duration
 
     def _stop(self, *, cancel: bool = False) -> None:
-        if cancel and self.shutdown_deadline is None:
-            self.shutdown_deadline = time.monotonic() + SHUTDOWN_TIMEOUT
-            if self.pool is not None and (
-                self.control
-                or (self.session and self.session.shouldstop)
-                or isinstance(sys.exception(), (KeyboardInterrupt, pytest.exit.Exception))
-            ):
-                self.pool.interrupt()
+        if cancel:
+            cancel_deadline = time.monotonic() + CANCEL_TIMEOUT
+            if self.shutdown_deadline is None or cancel_deadline < self.shutdown_deadline:
+                self.shutdown_deadline = cancel_deadline
+                if self.pool is not None and (
+                    self.control
+                    or (self.session and self.session.shouldstop)
+                    or isinstance(sys.exception(), (KeyboardInterrupt, pytest.exit.Exception))
+                ):
+                    self.pool.interrupt()
         if self.stopping:
             return
         self.stopping = True
